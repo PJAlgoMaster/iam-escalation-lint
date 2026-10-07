@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllBuckets",
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "RoleHandoff",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole", "iam:GetRole", "iam:ListRoles"],
+      "Resource": "*"
+    }
+  ]
+}
