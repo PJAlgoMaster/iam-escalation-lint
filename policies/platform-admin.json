@@ -1,0 +1,15 @@
+{
+  "RoleName": "platform-admin",
+  "PolicyName": "ops-bucket-full",
+  "Document": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "AllActionsOnOpsBuckets",
+        "Effect": "Allow",
+        "Action": "*",
+        "Resource": "arn:aws:s3:::ops-*"
+      }
+    ]
+  }
+}
