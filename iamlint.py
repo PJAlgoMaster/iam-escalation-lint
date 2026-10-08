@@ -1,9 +1,12 @@
-"""IAM privilege-escalation linter - phase 1.
+"""IAM privilege-escalation linter - phase 2.
 
 Walks a directory of exported AWS IAM policies, resolves Allow statements
-(including the inverted NotAction and NotResource forms) and prints the
-over-broad grants ranked by severity. Escalation primitives, the role trust
-graph and drift tracking arrive in later phases.
+(including the inverted NotAction and NotResource forms), prints the over-broad
+grants ranked by severity, then flags the roles that hold a known path to
+administrator: a single identity-writing primitive, or iam:PassRole paired with
+an action that runs code as a role.
+
+The role-to-role trust graph and the shortest-path search arrive in phase 3.
 
 Run:  python main.py [POLICY_DIR] [--top N]
 """
@@ -11,6 +14,7 @@ Run:  python main.py [POLICY_DIR] [--top N]
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import sys
 from dataclasses import dataclass, field
@@ -52,10 +56,50 @@ READ_PREFIXES = (
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
+# Actions that write permissions onto a principal, or otherwise hand one
+# identity the rights of another. Any of them alone is a step to administrator
+# for whoever holds it. This is the list from the public escalation write-ups,
+# trimmed to the actions that still work.
+ESCALATION_PRIMITIVES: dict[str, str] = {
+    "iam:CreatePolicyVersion": "rewrite a managed policy it can already see",
+    "iam:SetDefaultPolicyVersion": "promote an older version of a policy",
+    "iam:AttachUserPolicy": "attach an admin policy to a user it picks",
+    "iam:AttachRolePolicy": "attach an admin policy to a role it picks",
+    "iam:PutUserPolicy": "inline an admin policy onto a user it picks",
+    "iam:PutRolePolicy": "inline an admin policy onto a role it picks",
+    "iam:PutGroupPolicy": "inline an admin policy onto a group it picks",
+    "iam:AddUserToGroup": "drop a user it controls into an admin group",
+    "iam:CreateAccessKey": "mint access keys for another user",
+    "iam:CreateLoginProfile": "set a console password on another user",
+    "iam:UpdateLoginProfile": "reset another user's console password",
+    "iam:UpdateAssumeRolePolicy": "rewrite a role's trust policy to trust itself",
+    "sts:AssumeRole": "assume any role it can name",
+}
+
+# iam:PassRole is only half a finding. These are the actions that take the
+# passed role and run something as it, which is what turns the pass into code
+# execution with the role's permissions.
+PASS_ROLE_CONSUMERS: dict[str, str] = {
+    "lambda:CreateFunction": "run code as any role it can pass",
+    "lambda:UpdateFunctionCode": "replace a function's code and run as its role",
+    "lambda:UpdateFunctionConfiguration": "rebind a function to a role it can pass",
+    "ec2:RunInstances": "launch an instance with a profile it can pass",
+    "glue:CreateDevEndpoint": "run a notebook as any role it can pass",
+    "glue:UpdateDevEndpoint": "rebind a dev endpoint to a role it can pass",
+    "cloudformation:CreateStack": "run a stack with a service role it can pass",
+    "codebuild:CreateProject": "run a build as any role it can pass",
+    "codebuild:UpdateProject": "rebind a build project to a role it can pass",
+    "ecs:RegisterTaskDefinition": "register a task definition with a role it can pass",
+    "sagemaker:CreateNotebookInstance": "run a notebook as any role it can pass",
+    "datapipeline:CreatePipeline": "run a pipeline as any role it can pass",
+    "ssm:SendCommand": "run a command as any role it can pass",
+    "batch:SubmitJob": "submit a job that runs as any role it can pass",
+}
+
 
 @dataclass
 class Statement:
-    """One Allow statement, flattened into the fields the checks read."""
+    """One statement, flattened into the fields the checks read."""
 
     role: str
     policy: str
@@ -78,6 +122,16 @@ class Finding:
     index: int
     reason: str
     statement: dict[str, Any]
+
+
+@dataclass
+class Escalation:
+    """A role-level path to administrator, assembled from one or more statements."""
+
+    severity: str
+    role: str
+    reason: str
+    actions: tuple[str, ...]
 
 
 @dataclass
@@ -135,11 +189,12 @@ def _documents(payload: Any, stem: str) -> Iterator[tuple[str, str, dict[str, An
 def load_statements(directory: Path) -> tuple[list[Statement], Scan]:
     """Read every ``*.json`` policy under *directory*, recursively.
 
-    Deny statements are counted but not returned: this phase reports over-broad
-    Allow grants only.
+    Returns Deny statements as well as Allow ones. The wildcard checks skip
+    Deny, but the escalation checks need it to know when a primitive has been
+    taken back.
     """
     scan = Scan()
-    allows: list[Statement] = []
+    statements: list[Statement] = []
     for path in sorted(directory.rglob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -148,22 +203,22 @@ def load_statements(directory: Path) -> tuple[list[Statement], Scan]:
             continue
         scan.files += 1
         for role, policy, document in _documents(payload, path.stem):
-            statements = document.get("Statement") or []
-            if isinstance(statements, dict):
-                statements = [statements]
-            for index, raw in enumerate(statements):
+            entries = document.get("Statement") or []
+            if isinstance(entries, dict):
+                entries = [entries]
+            for index, raw in enumerate(entries):
                 if not isinstance(raw, dict):
                     continue
                 scan.statements += 1
-                if str(raw.get("Effect", "")).lower() != "allow":
-                    continue
-                scan.allows += 1
-                allows.append(
+                effect = str(raw.get("Effect", "")).strip().capitalize()
+                if effect == "Allow":
+                    scan.allows += 1
+                statements.append(
                     Statement(
                         role=role,
                         policy=policy,
                         index=index,
-                        effect="Allow",
+                        effect=effect,
                         actions=_as_list(raw.get("Action")),
                         not_actions=_as_list(raw.get("NotAction")),
                         resources=_as_list(raw.get("Resource")),
@@ -171,7 +226,7 @@ def load_statements(directory: Path) -> tuple[list[Statement], Scan]:
                         raw=raw,
                     )
                 )
-    return allows, scan
+    return statements, scan
 
 
 def _checks(statement: Statement) -> list[tuple[str, str]]:
@@ -198,7 +253,10 @@ def _checks(statement: Statement) -> list[tuple[str, str]]:
             )
         else:
             found.append(
-                ("HIGH", f"Allow NotAction on a scoped resource - permits everything except {excluded}")
+                (
+                    "HIGH",
+                    f"Allow NotAction on a scoped resource - permits everything except {excluded}",
+                )
             )
 
     if statement.not_resources:
@@ -252,6 +310,8 @@ def analyze(statements: Sequence[Statement]) -> list[Finding]:
     """Rank every Allow statement by its most severe over-broad grant."""
     findings: list[Finding] = []
     for statement in statements:
+        if statement.effect != "Allow":
+            continue
         checks = _checks(statement)
         if not checks:
             continue
@@ -270,51 +330,177 @@ def analyze(statements: Sequence[Statement]) -> list[Finding]:
     return findings
 
 
-def render(findings: Sequence[Finding], scan: Scan, detail_limit: int) -> str:
-    """Format the terminal report: ranked table, statement detail, totals."""
+def _covers(statement: Statement, action: str) -> bool:
+    """True when *statement*'s action list grants *action*.
+
+    A bare ``"*"`` action only counts when the statement is account-wide:
+    ``Action: "*"`` scoped to ``arn:aws:s3:::ops-*`` can never call an IAM
+    action, and counting it would be a false positive.
+    """
+    lowered = action.lower()
+    scoped = [grant for grant in statement.actions if grant != "*"]
+    if any(fnmatch.fnmatchcase(lowered, grant.lower()) for grant in scoped):
+        return True
+    if "*" in statement.actions and "*" in statement.resources:
+        return True
+    if statement.not_actions and "*" in statement.resources:
+        return not any(
+            fnmatch.fnmatchcase(lowered, grant.lower()) for grant in statement.not_actions
+        )
+    return False
+
+
+def _holds(statements: Sequence[Statement], action: str) -> bool:
+    """True when the role is granted *action* and no Deny takes it back.
+
+    Deny is treated as a blanket block on the actions it names. Conditions on
+    the Deny are not evaluated, so a conditional Deny still reads as a block.
+    """
+    if not any(_covers(s, action) for s in statements if s.effect == "Allow"):
+        return False
+    return not any(_covers(s, action) for s in statements if s.effect == "Deny")
+
+
+def _is_full_admin(statements: Sequence[Statement]) -> bool:
+    """True when the role already holds ``Allow "*" on "*"``.
+
+    Nothing can be escalated to, and listing all thirteen primitives under an
+    existing CRITICAL wildcard row is noise.
+    """
+    return any(
+        s.effect == "Allow" and "*" in s.actions and "*" in s.resources
+        for s in statements
+    )
+
+
+def find_escalations(statements: Sequence[Statement]) -> list[Escalation]:
+    """Flag every role that holds a known one-step path to administrator."""
+    by_role: dict[str, list[Statement]] = {}
+    for statement in statements:
+        by_role.setdefault(statement.role, []).append(statement)
+
+    found: list[Escalation] = []
+    for role, held_by_role in sorted(by_role.items()):
+        if _is_full_admin(held_by_role):
+            continue
+
+        if _holds(held_by_role, "iam:PassRole"):
+            consumers = [action for action in PASS_ROLE_CONSUMERS if _holds(held_by_role, action)]
+            if consumers:
+                first = consumers[0]
+                extra = f" (+{len(consumers) - 1} more)" if len(consumers) > 1 else ""
+                found.append(
+                    Escalation(
+                        severity="CRITICAL",
+                        role=role,
+                        reason=(
+                            f"iam:PassRole into {first}{extra} - "
+                            f"{PASS_ROLE_CONSUMERS[first]}"
+                        ),
+                        actions=("iam:PassRole", *consumers),
+                    )
+                )
+
+        primitives = [
+            action for action in ESCALATION_PRIMITIVES if _holds(held_by_role, action)
+        ]
+        if primitives:
+            if len(primitives) == 1:
+                reason = f"{primitives[0]} - {ESCALATION_PRIMITIVES[primitives[0]]}"
+            else:
+                shown = ", ".join(primitives[:3])
+                more = f", +{len(primitives) - 3} more" if len(primitives) > 3 else ""
+                reason = f"{shown}{more} - {len(primitives)} one-step paths to administrator"
+            found.append(
+                Escalation(
+                    severity="HIGH",
+                    role=role,
+                    reason=reason,
+                    actions=tuple(primitives),
+                )
+            )
+
+    found.sort(key=lambda e: (SEVERITY_ORDER[e.severity], e.role))
+    return found
+
+
+def render(
+    findings: Sequence[Finding],
+    escalations: Sequence[Escalation],
+    scan: Scan,
+    detail_limit: int,
+) -> str:
+    """Format the terminal report: wildcard table, escalation paths, totals."""
     lines = [
-        "IAM PRIVILEGE ESCALATION LINT - phase 1 (wildcard and NotAction audit)",
+        "IAM PRIVILEGE ESCALATION LINT - phase 2 (wildcard audit + escalation primitives)",
         f"scanned {scan.files} policy files | {scan.statements} statements | {scan.allows} Allow",
         "",
     ]
-    if not findings:
-        lines.append("no over-broad Allow statements found")
-        return "\n".join(lines)
 
-    sev_w = max(len("SEV"), max(len(f.severity) for f in findings))
-    role_w = max(len("ROLE"), max(len(f.role) for f in findings))
-    pol_w = max(len("POLICY"), max(len(f.policy) for f in findings))
-    idx_w = max(len("STMT"), max(len(str(f.index)) for f in findings))
+    if findings:
+        sev_w = max(len("SEV"), max(len(f.severity) for f in findings))
+        role_w = max(len("ROLE"), max(len(f.role) for f in findings))
+        pol_w = max(len("POLICY"), max(len(f.policy) for f in findings))
+        idx_w = max(len("STMT"), max(len(str(f.index)) for f in findings))
 
-    lines.append(
-        f"{'SEV':<{sev_w}}  {'ROLE':<{role_w}}  {'POLICY':<{pol_w}}  "
-        f"{'STMT':>{idx_w}}  WHY"
-    )
-    for finding in findings:
         lines.append(
-            f"{finding.severity:<{sev_w}}  {finding.role:<{role_w}}  "
-            f"{finding.policy:<{pol_w}}  {finding.index:>{idx_w}}  {finding.reason}"
+            f"{'SEV':<{sev_w}}  {'ROLE':<{role_w}}  {'POLICY':<{pol_w}}  "
+            f"{'STMT':>{idx_w}}  WHY"
         )
+        for finding in findings:
+            lines.append(
+                f"{finding.severity:<{sev_w}}  {finding.role:<{role_w}}  "
+                f"{finding.policy:<{pol_w}}  {finding.index:>{idx_w}}  {finding.reason}"
+            )
 
-    detail = findings[:detail_limit]
-    if detail:
-        lines.append("")
-        lines.append(f"--- statement detail (top {len(detail)}) ---")
-        for finding in detail:
-            lines.append(f"{finding.severity} {finding.role}/{finding.policy} [{finding.index}]")
-            lines.append("  " + json.dumps(finding.statement))
+        detail = findings[:detail_limit]
+        if detail:
+            lines.append("")
+            lines.append(f"--- statement detail (top {len(detail)}) ---")
+            for finding in detail:
+                lines.append(
+                    f"{finding.severity} {finding.role}/{finding.policy} [{finding.index}]"
+                )
+                lines.append("  " + json.dumps(finding.statement))
+    else:
+        lines.append("no over-broad Allow statements found")
+
+    lines.append("")
+    lines.append("--- escalation paths (role -> administrator) ---")
+    if escalations:
+        sev_w = max(len("SEV"), max(len(e.severity) for e in escalations))
+        role_w = max(len("ROLE"), max(len(e.role) for e in escalations))
+        lines.append(f"{'SEV':<{sev_w}}  {'ROLE':<{role_w}}  PATH")
+        for escalation in escalations:
+            lines.append(
+                f"{escalation.severity:<{sev_w}}  {escalation.role:<{role_w}}  "
+                f"{escalation.reason}"
+            )
+    else:
+        lines.append("no role holds a known escalation primitive")
 
     tally = {sev: sum(1 for f in findings if f.severity == sev) for sev in SEVERITY_ORDER}
     summary = ", ".join(f"{count} {sev}" for sev, count in tally.items() if count)
+    esc_tally = {
+        sev: sum(1 for e in escalations if e.severity == sev) for sev in SEVERITY_ORDER
+    }
+    esc_summary = ", ".join(f"{count} {sev}" for sev, count in esc_tally.items() if count)
+
     lines.append("")
-    lines.append(f"{len(findings)} findings - {summary}")
+    lines.append(f"{len(findings)} findings" + (f" - {summary}" if summary else ""))
+    lines.append(
+        f"{len(escalations)} escalation paths" + (f" - {esc_summary}" if esc_summary else "")
+    )
     return "\n".join(lines)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments, scan the policy directory and print the report."""
     parser = argparse.ArgumentParser(
-        description="Report over-broad Allow statements in exported AWS IAM policies."
+        description=(
+            "Report over-broad Allow statements and role-level privilege "
+            "escalation paths in exported AWS IAM policies."
+        )
     )
     parser.add_argument(
         "directory",
@@ -336,5 +522,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     statements, scan = load_statements(directory)
-    print(render(analyze(statements), scan, args.top))
+    print(render(analyze(statements), find_escalations(statements), scan, args.top))
     return 0
