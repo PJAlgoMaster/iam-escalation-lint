@@ -1,0 +1,80 @@
+[
+  {
+    "RoleName": "ops-admin",
+    "PolicyName": "admin-ops",
+    "Document": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "EverythingEverywhere",
+          "Effect": "Allow",
+          "Action": "*",
+          "Resource": "*"
+        }
+      ]
+    },
+    "AssumeRolePolicyDocument": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "AWS": "arn:aws:iam::111122223333:role/release-runner"
+          },
+          "Action": "sts:AssumeRole"
+        }
+      ]
+    }
+  },
+  {
+    "RoleName": "release-runner",
+    "PolicyName": "release-ops",
+    "Document": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "AssumeOpsAdmin",
+          "Effect": "Allow",
+          "Action": "sts:AssumeRole",
+          "Resource": "arn:aws:iam::111122223333:role/ops-admin"
+        }
+      ]
+    },
+    "AssumeRolePolicyDocument": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "AWS": [
+              "arn:aws:iam::111122223333:role/ci-runner",
+              "arn:aws:iam::111122223333:role/dev-readonly"
+            ]
+          },
+          "Action": "sts:AssumeRole"
+        }
+      ]
+    }
+  },
+  {
+    "RoleName": "dev-readonly",
+    "PolicyName": "read-only",
+    "Document": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "ReadTooling",
+          "Effect": "Allow",
+          "Action": ["s3:GetObject", "ec2:DescribeInstances"],
+          "Resource": "*"
+        },
+        {
+          "Sid": "AssumeRelease",
+          "Effect": "Allow",
+          "Action": "sts:AssumeRole",
+          "Resource": "arn:aws:iam::111122223333:role/release-runner"
+        }
+      ]
+    }
+  }
+]
