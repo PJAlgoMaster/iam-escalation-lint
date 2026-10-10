@@ -1,9 +1,10 @@
-"""Assert-based checks for the finding rules and the escalation engine.
+"""Assert-based checks for the finding rules, the escalation engine and the
+reachability graph.
 
 Run: python test_iamlint.py
 """
 
-from iamlint import Statement, analyze, find_escalations
+from iamlint import Statement, analyze, find_escalations, find_paths
 
 
 def stmt(
@@ -12,10 +13,11 @@ def stmt(
     not_actions: tuple[str, ...] = (),
     resources: tuple[str, ...] = (),
     not_resources: tuple[str, ...] = (),
+    role: str = "test-role",
 ) -> Statement:
     """Build a statement with only the fields the checks read."""
     return Statement(
-        role="test-role",
+        role=role,
         policy="test-policy",
         index=0,
         effect=effect,
@@ -160,6 +162,102 @@ ESCALATION_CASES: list[tuple[str, list[Statement], str | None]] = [
     ),
 ]
 
+ADMIN = stmt(actions=("*",), resources=("*",), role="admin-role")
+
+GRAPH_CASES: list[tuple[str, list[Statement], dict[str, tuple[str, ...]], str | None]] = [
+    (
+        "one assume hop into a full admin role is critical",
+        [
+            stmt(actions=("sts:AssumeRole",), resources=("arn:aws:iam::1:role/admin-role",)),
+            ADMIN,
+        ],
+        {"admin-role": ("test-role",)},
+        "CRITICAL",
+    ),
+    (
+        "a two-hop chain is high",
+        [
+            stmt(actions=("sts:AssumeRole",), resources=("arn:aws:iam::1:role/mid-role",)),
+            stmt(
+                actions=("sts:AssumeRole",),
+                resources=("arn:aws:iam::1:role/admin-role",),
+                role="mid-role",
+            ),
+            ADMIN,
+        ],
+        {"mid-role": ("test-role",), "admin-role": ("mid-role",)},
+        "HIGH",
+    ),
+    (
+        "a trust that names someone else leaves no edge",
+        [
+            stmt(actions=("sts:AssumeRole",), resources=("arn:aws:iam::1:role/admin-role",)),
+            ADMIN,
+        ],
+        {"admin-role": ("another-role",)},
+        None,
+    ),
+    (
+        "trust without the assume permission is not a route",
+        [stmt(actions=("s3:GetObject",), resources=("*",)), ADMIN],
+        {"admin-role": ("test-role",)},
+        None,
+    ),
+    (
+        "a Deny on sts:AssumeRole removes the edge",
+        [
+            stmt(actions=("sts:AssumeRole",), resources=("arn:aws:iam::1:role/admin-role",)),
+            stmt(effect="Deny", actions=("sts:AssumeRole",), resources=("*",)),
+            ADMIN,
+        ],
+        {"admin-role": ("test-role",)},
+        None,
+    ),
+    (
+        "a role that only holds assume is a hop, not a destination",
+        [
+            stmt(actions=("sts:AssumeRole",), resources=("arn:aws:iam::1:role/mid-role",)),
+            stmt(actions=("sts:AssumeRole",), resources=("*",), role="mid-role"),
+        ],
+        {"mid-role": ("test-role",)},
+        None,
+    ),
+    (
+        "a wildcard principal in the trust policy still needs the assume grant",
+        [
+            stmt(actions=("sts:AssumeRole",), resources=("arn:aws:iam::1:role/admin-role",)),
+            ADMIN,
+        ],
+        {"admin-role": ("*",)},
+        "CRITICAL",
+    ),
+    (
+        "a role that is already administrator is not a source",
+        [
+            stmt(actions=("iam:CreateAccessKey",), resources=("*",)),
+            stmt(actions=("sts:AssumeRole",), resources=("arn:aws:iam::1:role/admin-role",)),
+            ADMIN,
+        ],
+        {"admin-role": ("test-role",)},
+        None,
+    ),
+    (
+        "the shortest chain wins",
+        [
+            stmt(actions=("sts:AssumeRole",), resources=("arn:aws:iam::1:role/mid-role",)),
+            stmt(actions=("sts:AssumeRole",), resources=("arn:aws:iam::1:role/admin-role",)),
+            stmt(
+                actions=("sts:AssumeRole",),
+                resources=("arn:aws:iam::1:role/admin-role",),
+                role="mid-role",
+            ),
+            ADMIN,
+        ],
+        {"mid-role": ("test-role",), "admin-role": ("test-role", "mid-role")},
+        "CRITICAL",
+    ),
+]
+
 
 def main() -> int:
     """Run every case and report how many passed."""
@@ -179,7 +277,14 @@ def main() -> int:
             failures += 1
             print(f"FAIL {name}: expected {expected}, got {got}")
 
-    total = len(CASES) + len(ESCALATION_CASES)
+    for name, statements, trusts, expected in GRAPH_CASES:
+        routes = find_paths(statements, trusts)
+        got = routes[0].severity if routes else None
+        if got != expected:
+            failures += 1
+            print(f"FAIL {name}: expected {expected}, got {got}")
+
+    total = len(CASES) + len(ESCALATION_CASES) + len(GRAPH_CASES)
     print(f"{total - failures}/{total} checks passed")
     return 1 if failures else 0
 
