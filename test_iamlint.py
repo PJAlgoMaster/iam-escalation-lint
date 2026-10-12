@@ -1,10 +1,26 @@
-"""Assert-based checks for the finding rules, the escalation engine and the
-reachability graph.
+"""Assert-based checks for the finding rules, the escalation engine, the
+reachability graph and the sqlite baseline.
 
 Run: python test_iamlint.py
 """
 
-from iamlint import Statement, analyze, find_escalations, find_paths
+import tempfile
+from pathlib import Path
+
+from iamlint import (
+    Escalation,
+    Finding,
+    Record,
+    Route,
+    Statement,
+    analyze,
+    compare,
+    find_escalations,
+    find_paths,
+    load_baseline,
+    save_baseline,
+    snapshot,
+)
 
 
 def stmt(
@@ -27,6 +43,23 @@ def stmt(
         not_resources=not_resources,
         raw={},
     )
+
+
+def finding(severity: str = "HIGH", reason: str = "one") -> Finding:
+    """Build a finding with the fields the baseline reads."""
+    return Finding(
+        severity=severity,
+        role="test-role",
+        policy="test-policy",
+        index=0,
+        reason=reason,
+        statement={},
+    )
+
+
+def stored(records: list[Record]) -> dict[str, tuple[str, str, str]]:
+    """Pack records the way ``load_baseline`` hands them back."""
+    return {record.fingerprint: (record.kind, record.ident, record.severity) for record in records}
 
 
 CASES: list[tuple[str, Statement, str | None]] = [
@@ -258,6 +291,81 @@ GRAPH_CASES: list[tuple[str, list[Statement], dict[str, tuple[str, ...]], str | 
     ),
 ]
 
+# Three rows, one of each kind, as the first run would record them.
+FIRST = snapshot(
+    [finding()],
+    [
+        Escalation(
+            severity="HIGH",
+            role="test-role",
+            reason="sts:AssumeRole - assume any role it can name",
+            actions=("sts:AssumeRole",),
+        )
+    ],
+    [
+        Route(
+            severity="HIGH",
+            source="test-role",
+            target="admin-role",
+            hops=("test-role", "admin-role"),
+            reason='holds Allow "*" on "*"',
+        )
+    ],
+)
+
+BASELINE_CASES: list[tuple[str, list[Record], list[Record], tuple[int, int, int]]] = [
+    ("an empty snapshot makes every row new", [], FIRST, (3, 0, 0)),
+    ("an unchanged run reports nothing", FIRST, FIRST, (0, 0, 3)),
+    ("a finding that goes away is fixed", FIRST, FIRST[1:], (0, 1, 2)),
+    (
+        "a finding that appears is new",
+        FIRST,
+        FIRST + snapshot([finding(reason="two")], [], []),
+        (1, 0, 3),
+    ),
+    (
+        "a raised severity is one fixed and one new",
+        FIRST,
+        FIRST[:2] + snapshot([finding(severity="CRITICAL")], [], []),
+        (1, 1, 2),
+    ),
+]
+
+
+def baseline_checks() -> tuple[int, int]:
+    """Run the drift cases and the sqlite round trips; return (checks, failures)."""
+    checks = 0
+    failures = 0
+
+    for name, before, after, expected in BASELINE_CASES:
+        checks += 1
+        new, fixed, unchanged = compare(stored(before), after)
+        got = (len(new), len(fixed), unchanged)
+        if got != expected:
+            failures += 1
+            print(f"FAIL {name}: expected {expected}, got {got}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "baseline.db"
+
+        checks += 1
+        save_baseline(path, FIRST, "2026-10-12T09:14:03")
+        loaded, stamp = load_baseline(path)
+        new, fixed, unchanged = compare(loaded, FIRST)
+        got = (len(new), len(fixed), unchanged, stamp)
+        if got != (0, 0, 3, "2026-10-12T09:14:03"):
+            failures += 1
+            print(f"FAIL baseline survives a round trip: got {got}")
+
+        checks += 1
+        save_baseline(path, FIRST[1:], "2026-10-12T09:20:00")
+        loaded, _ = load_baseline(path)
+        if len(loaded) != 2:
+            failures += 1
+            print(f"FAIL a second save should replace the snapshot: {len(loaded)} rows left")
+
+    return checks, failures
+
 
 def main() -> int:
     """Run every case and report how many passed."""
@@ -284,7 +392,9 @@ def main() -> int:
             failures += 1
             print(f"FAIL {name}: expected {expected}, got {got}")
 
-    total = len(CASES) + len(ESCALATION_CASES) + len(GRAPH_CASES)
+    checks, baseline_failures = baseline_checks()
+    failures += baseline_failures
+    total = len(CASES) + len(ESCALATION_CASES) + len(GRAPH_CASES) + checks
     print(f"{total - failures}/{total} checks passed")
     return 1 if failures else 0
 
