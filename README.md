@@ -5,16 +5,27 @@ over-broad Allow statements, ranked by severity, the roles that hold a known
 one-step path to administrator, and the shortest assume route from a role that
 is not admin to one that is.
 
+Every row also goes into a sqlite baseline, so the next run prints only what
+changed: the new rows in full, the rows that have gone away as fixed, and a
+count of what is unchanged.
+
 ## Run
 
     python main.py
 
 No arguments, no network, no dependencies outside the Python 3 standard
-library. It reads the sample policy set in `policies/` and prints a report.
+library. It reads the sample policy set in `policies/`, prints a report and
+records it in `.iamlint-baseline.db` in the working directory.
 
 Point it at a real export by passing the directory:
 
     python main.py ~/exports/iam-policies-2026-10-08
+
+| Flag | Effect |
+|---|---|
+| `--top N` | how many new findings get their raw statement printed (default 10) |
+| `--baseline FILE` | where the snapshot lives (default `.iamlint-baseline.db`) |
+| `--reset` | ignore the stored snapshot and report every finding as new again |
 
 ## What it finds
 
@@ -44,7 +55,66 @@ and asks whether the role can reach admin in one step.
 
 | Severity | Pattern | Why it matters |
 |---|---|---|
-| CRITICAL | `iam:PassRole` plus an action that runs code as a role | `lambda:CreateFunction`, `ec2:RunInstances`, `glue:CreateDevEndpoint`, `cloudformation:CreateStack` and nine more. Pass a role, run code as it. |
+| CRITICAL | `iam:PassRole` plus an action that runs code as a role | `lambda:CreateFunction`, `ec2:RunInstances`, `glue:CreateDevEndpoint`, `cloudformation:CreateStack` and nine<files>
+<file name="README.md">
+# iam-escalation-lint
+
+Reads a directory of exported AWS IAM policies and prints three things: the
+over-broad Allow statements, ranked by severity, the roles that hold a known
+one-step path to administrator, and the shortest assume route from a role that
+is not admin to one that is.
+
+Every row also goes into a sqlite baseline, so the next run prints only what
+changed: the new rows in full, the rows that have gone away as fixed, and a
+count of what is unchanged.
+
+## Run
+
+    python main.py
+
+No arguments, no network, no dependencies outside the Python 3 standard
+library. It reads the sample policy set in `policies/`, prints a report and
+records it in `.iamlint-baseline.db` in the working directory.
+
+Point it at a real export by passing the directory:
+
+    python main.py ~/exports/iam-policies-2026-10-08
+
+| Flag | Effect |
+|---|---|
+| `--top N` | how many new findings get their raw statement printed (default 10) |
+| `--baseline FILE` | where the snapshot lives (default `.iamlint-baseline.db`) |
+| `--reset` | ignore the stored snapshot and report every finding as new again |
+
+## What it finds
+
+### Over-broad Allow statements
+
+| Severity | Pattern | Why it matters |
+|---|---|---|
+| CRITICAL | `Action: "*"` with `Resource: "*"` | Full administrator. |
+| CRITICAL | `NotAction` with `Resource: "*"` | Inverted logic: permits every action except the short excluded list. |
+| HIGH | `Action: "*"` on a scoped resource | Every action, including the ones AWS adds next quarter. |
+| HIGH | `iam:*`, `sts:*`, `kms:*` | Service-wide control of a privilege-bearing service. |
+| HIGH | `s3:*` with `Resource: "*"` | Service-wide control of every bucket in the account. |
+| HIGH | A named action on `*` under `iam`/`sts`/`kms` | Narrow action, no resource scope. `iam:PassRole` on `*` is an escalation primitive. |
+| HIGH | `NotResource` on an Allow | Permits every resource except the excluded prefix. |
+| MEDIUM | `dynamodb:*` on one table | Service-wide, but scoped to one resource. |
+| MEDIUM | Named write actions on `*` | No resource scoping. |
+| LOW | `s3:Get*`, `s3:List*` | Read-only wildcard. Tolerable, still worth knowing. |
+
+Deny statements are counted and skipped here. `NotAction: "*"` grants nothing
+and is skipped too.
+
+### Escalation paths
+
+A statement can look harmless on its own and still be the first step to
+administrator. This second pass reads every statement a role holds together
+and asks whether the role can reach admin in one step.
+
+| Severity | Pattern | Why it matters |
+|---|---|---|
+| CRITICAL | `iam:PassRole` plus an action that runs code as a role | `lambda:CreateFunction`, `ec2:RunInstances`, `glue:CreateDevEndpoint`, `cloudformation:CreateStack` and ten more. Pass a role, run code as it. |
 | HIGH | Any one identity-writing primitive | `iam:CreatePolicyVersion`, `iam:AttachRolePolicy`, `iam:UpdateAssumeRolePolicy`, `iam:AddUserToGroup`, `sts:AssumeRole` and eight more. |
 
 Two things are deliberately *not* reported again in this section:
@@ -72,6 +142,27 @@ over every role that is not admin-equivalent, and reports the shortest chain.
 This is where `sts:AssumeRole` stops being a generic HIGH row. Phase 2 cannot
 say *where* an assume lands; the graph can, and it names the role.
 
+## Baseline and drift
+
+Each run writes every row it produced, findings and escalation paths and assume
+routes alike, into a sqlite file with a fingerprint per row. The next run
+compares against that snapshot and splits the results three ways:
+
+- **new** - the row was not in the snapshot. Printed in full, in the usual
+  tables, and the only rows `--top` expands.
+- **fixed** - the snapshot held it and this run does not. Listed under a
+  `fixed since <timestamp>` heading with its severity.
+- **unchanged** - counted, not printed.
+
+A row's identity is its kind, its label (role/policy/index for a finding, the
+role for an escalation, `source -> target` for a route), its severity and its
+reason. Severity is part of it on purpose: a rule that starts calling a row
+critical reprints the row rather than passing it off as unchanged.
+
+The baseline is a build artifact, not source. Delete it, or pass `--reset`, to
+get a clean first run. It is safe to keep one per policy export: point
+`--baseline` somewhere else when you switch accounts or directories.
+
 ## Input format
 
 Every `*.json` file under the directory is read, recursively. A file may be:
@@ -88,50 +179,45 @@ Every `*.json` file under the directory is read, recursively. A file may be:
 
 ## Sample output
 
-The bundled set is 12 policy files, 21 statements, 19 of them Allow:
+First run. No baseline file yet, so every row is new and the report reads
+exactly as it did before the baseline existed, plus one header line.
 
-    IAM PRIVILEGE ESCALATION LINT - phase 3 (wildcard audit + escalation primitives + reachability)
+    IAM PRIVILEGE ESCALATION LINT - phase 4 (wildcard audit + escalation primitives + reachability + baseline drift)
     scanned 12 policy files | 21 statements | 19 Allow
+    baseline .iamlint-baseline.db initialised - 22 findings recorded
 
     SEV       ROLE              POLICY             STMT  WHY
     CRITICAL  app-deploy        deploy-artifacts      0  Allow "*" on "*" - full administrator
     CRITICAL  ci-runner         ci-runner             0  Allow NotAction on "*" - permits everything except iam:*, organizations:*
     CRITICAL  ops-admin         admin-ops             0  Allow "*" on "*" - full administrator
     HIGH      backup            backup                0  Allow kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey on "*" - named control of kms
-    HIGH      build-release     deploy-pipeline       1  Allow iam:PassRole on a scoped resource - named control of iam
-    HIGH      data-science      data-science          0  Allow s3:* on "*" - service-wide control
-    HIGH      data-science      data-science          1  Allow iam:PassRole, iam:GetRole, iam:ListRoles on "*" - named control of iam
-    HIGH      dev-readonly      read-only             1  Allow sts:AssumeRole on a scoped resource - named control of sts
-    HIGH      legacy-migration  legacy-migration      0  Allow NotResource - permits every resource except arn:aws:s3:::locked-*/*
-    HIGH      platform-admin    ops-bucket-full       0  Allow "*" on a scoped resource - every action, no action filtering
-    HIGH      release-runner    release-ops           0  Allow sts:AssumeRole on a scoped resource - named control of sts
-    MEDIUM    analytics         analytics             0  Allow dynamodb:* on a scoped resource - service-wide control
-    MEDIUM    analytics         analytics             1  Allow 2 named actions on "*" - no resource scoping
-    MEDIUM    dev-readonly      read-only             0  Allow 2 named actions on "*" - no resource scoping
-    LOW       reporting         reporting             0  Allow s3:Get*, s3:List* - read-only wildcard
-
-    --- statement detail (top 10) ---
-    CRITICAL app-deploy/deploy-artifacts [0]
-      {"Sid": "FullAccess", "Effect": "Allow", "Action": "*", "Resource": "*"}
-
     ...
-
-    --- escalation paths (role -> administrator) ---
-    SEV       ROLE            PATH
-    CRITICAL  build-release   iam:PassRole into lambda:CreateFunction (+1 more) - run code as any role it can pass
-    HIGH      ci-runner       sts:AssumeRole - assume any role it can name
-    HIGH      dev-readonly    sts:AssumeRole - assume any role it can name
-    HIGH      release-runner  sts:AssumeRole - assume any role it can name
-
-    --- reachability (role -> role) ---
-    SEV       FROM            HOPS  PATH
-    CRITICAL  release-runner     1  release-runner -> ops-admin (holds Allow "*" on "*")
-    HIGH      ci-runner          2  ci-runner -> release-runner -> ops-admin (holds Allow "*" on "*")
-    HIGH      dev-readonly       2  dev-readonly -> release-runner -> ops-admin (holds Allow "*" on "*")
 
     15 findings - 3 CRITICAL, 8 HIGH, 3 MEDIUM, 1 LOW
     4 escalation paths - 1 CRITICAL, 3 HIGH
     3 assume routes to administrator - 1 CRITICAL, 2 HIGH
+
+Second run, nothing on disk changed. The three passes still ran; none of them
+found anything the snapshot did not already hold.
+
+    IAM PRIVILEGE ESCALATION LINT - phase 4 (wildcard audit + escalation primitives + reachability + baseline drift)
+    scanned 12 policy files | 21 statements | 19 Allow
+    baseline .iamlint-baseline.db | compared against 2026-10-12T09:14:03
+
+    no new over-broad Allow statements
+
+    --- escalation paths (role -> administrator) ---
+    no new escalation paths
+
+    --- reachability (role -> role) ---
+    no new assume routes to administrator
+
+    nothing new since 2026-10-12T09:14:03 - 0 fixed, 22 unchanged
+
+Now loosen `policies/build-release.json`: give `iam:PassRole` a `Resource` of
+`"*"` and add `sts:AssumeRole` on the ops-admin role. The next run prints those
+two rows, plus whatever the reachability pass now discovers through them, and
+counts the other 22 rows as unchanged.
 
 `build-release` is the one to read twice. Phase 1 sees a single HIGH row for
 `iam:PassRole`. Phase 2 sees that the same role can call `lambda:CreateFunction`,
@@ -143,18 +229,14 @@ so it can pass itself an admin role and run code as it. `data-science` holds
 trusts it, and `ops-admin` trusts `release-runner`, so two hops separate a role
 with no IAM actions at all from full administrator.
 
-`--top N` controls how many findings get their raw statement printed
-underneath the table. Default is 10.
-
 ## Checks
 
     python test_iamlint.py
 
-35 assert-based cases: 14 over the wildcard rules, 12 over the escalation
-engine, 9 over the reachability graph.
+42 assert-based cases: 14 over the wildcard rules, 12 over the escalation
+engine, 9 over the reachability graph, 7 over the baseline (five drift
+classifications and two sqlite round trips).
 
 ## Next phases
 
-- Phase 4: sqlite baseline, so a re-run prints only new, fixed and unchanged
-  findings.
 - Phase 5: SARIF and JSON output plus severity thresholds for CI.
