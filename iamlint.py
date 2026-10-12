@@ -1,4 +1,4 @@
-"""IAM privilege-escalation linter - phase 3.
+"""IAM privilege-escalation linter - phase 4.
 
 Walks a directory of exported AWS IAM policies, resolves Allow statements
 (including the inverted NotAction and NotResource forms), prints the over-broad
@@ -6,23 +6,31 @@ grants ranked by severity, flags the roles that hold a known one-step path to
 administrator, then builds the role-to-role trust graph and searches it for the
 shortest assume route from any role that is not admin-equivalent to one that is.
 
-The sqlite baseline and the CI output formats arrive in phase 4 and phase 5.
+Every row is also written to a sqlite baseline, so the next run prints only what
+the snapshot did not already hold: the new rows in full, the rows that have gone
+away as fixed, and a count of what is unchanged.
 
-Run:  python main.py [POLICY_DIR] [--top N]
+The CI output formats and severity thresholds arrive in phase 5.
+
+Run:  python main.py [POLICY_DIR] [--top N] [--baseline FILE] [--reset]
 """
 
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
+import sqlite3
 import sys
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence, TypeVar
 
 DEFAULT_POLICY_DIR = Path(__file__).resolve().parent / "policies"
+DEFAULT_BASELINE = Path(".iamlint-baseline.db")
 
 # Services where a wildcard is a privilege problem and not only a data-access
 # one: they control identity, keys or the audit trail itself.
@@ -94,6 +102,19 @@ PASS_ROLE_CONSUMERS: dict[str, str] = {
     "batch:SubmitJob": "submit a job that runs as any role it can pass",
 }
 
+BASELINE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS findings (
+    fingerprint TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    ident       TEXT NOT NULL,
+    severity    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
 
 @dataclass
 class Statement:
@@ -141,6 +162,36 @@ class Route:
     target: str
     hops: tuple[str, ...]
     reason: str
+
+
+@dataclass(frozen=True)
+class Record:
+    """One reportable row, reduced to the identity the baseline compares on."""
+
+    kind: str
+    ident: str
+    severity: str
+    reason: str
+
+    @property
+    def fingerprint(self) -> str:
+        """Stable hash of everything that makes this row what it is.
+
+        Severity and reason are part of it on purpose: a rule that starts
+        calling a row critical is a change worth printing, not a quiet edit.
+        """
+        body = "|".join((self.kind, self.ident, self.severity, self.reason))
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass
+class Drift:
+    """What changed between the stored snapshot and this run."""
+
+    baseline: Path
+    previous_run: str | None
+    fixed: tuple[tuple[str, str, str], ...]
+    unchanged: int
 
 
 @dataclass
@@ -636,20 +687,134 @@ def _is_trusted_by(principals: Sequence[str], role: str) -> bool:
     return "*" in principals or role in principals
 
 
-def _table(rows: Sequence[tuple[str, ...]], headers: Sequence[str]) -> list[str]:
-    """Render a left-aligned column table with a header row."""
-    widths = [
-        max(len(headers[col]), *(len(row[col]) for row in rows)) for col in range(len(headers))
+def _finding_record(finding: Finding) -> Record:
+    """Reduce a finding to the identity the baseline stores."""
+    return Record(
+        kind="finding",
+        ident=f"{finding.role}/{finding.policy} [{finding.index}]",
+        severity=finding.severity,
+        reason=finding.reason,
+    )
+
+
+def _escalation_record(escalation: Escalation) -> Record:
+    """Reduce an escalation path to the identity the baseline stores."""
+    return Record(
+        kind="escalation",
+        ident=escalation.role,
+        severity=escalation.severity,
+        reason=escalation.reason,
+    )
+
+
+def _route_record(route: Route) -> Record:
+    """Reduce an assume route to the identity the baseline stores."""
+    return Record(
+        kind="route",
+        ident=f"{route.source} -> {route.target}",
+        severity=route.severity,
+        reason=route.reason,
+    )
+
+
+def snapshot(
+    findings: Sequence[Finding],
+    escalations: Sequence[Escalation],
+    routes: Sequence[Route],
+) -> list[Record]:
+    """Reduce a whole run to the comparable rows the baseline holds."""
+    return [
+        *(_finding_record(finding) for finding in findings),
+        *(_escalation_record(escalation) for escalation in escalations),
+        *(_route_record(route) for route in routes),
     ]
-    lines = [
-        "  ".join(
-            header.ljust(width) if col == 0 else header.ljust(width)
-            for col, (header, width) in enumerate(zip(headers, widths))
+
+
+def compare(
+    previous: dict[str, tuple[str, str, str]], records: Sequence[Record]
+) -> tuple[list[Record], list[tuple[str, str, str]], int]:
+    """Split this run's records against the stored snapshot.
+
+    Returns the new records, the rows the snapshot held and this run does not
+    (fixed), and how many records the two snapshots share.
+    """
+    new = [record for record in records if record.fingerprint not in previous]
+    current = {record.fingerprint for record in records}
+    fixed = [row for fingerprint, row in previous.items() if fingerprint not in current]
+    fixed.sort(key=lambda row: (SEVERITY_ORDER.get(row[2], len(SEVERITY_ORDER)), row[1]))
+    return new, fixed, len(records) - len(new)
+
+
+def load_baseline(path: Path) -> tuple[dict[str, tuple[str, str, str]], str | None]:
+    """Read the stored snapshot, as ``fingerprint -> (kind, ident, severity)``.
+
+    Also returns the timestamp of the run that wrote it. A missing file is a
+    first run; a file sqlite cannot read is treated the same way, with a note
+    on stderr, so a damaged baseline costs a re-record and not a crashed scan.
+    """
+    if not path.exists():
+        return {}, None
+    try:
+        connection = sqlite3.connect(path)
+    except sqlite3.Error as exc:
+        print(f"ignored {path}: {exc}", file=sys.stderr)
+        return {}, None
+    try:
+        connection.executescript(BASELINE_SCHEMA)
+        rows = connection.execute(
+            "SELECT fingerprint, kind, ident, severity FROM findings"
+        ).fetchall()
+        stamp = connection.execute("SELECT value FROM meta WHERE key = 'last_run'").fetchone()
+    except sqlite3.DatabaseError as exc:
+        print(f"ignored {path}: {exc}", file=sys.stderr)
+        return {}, None
+    finally:
+        connection.close()
+    return {row[0]: (row[1], row[2], row[3]) for row in rows}, (stamp[0] if stamp else None)
+
+
+def save_baseline(path: Path, records: Sequence[Record], when: str) -> None:
+    """Replace the stored snapshot with this run's records and stamp it."""
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(BASELINE_SCHEMA)
+        connection.execute("DELETE FROM findings")
+        connection.executemany(
+            "INSERT INTO findings (fingerprint, kind, ident, severity) VALUES (?, ?, ?, ?)",
+            [(r.fingerprint, r.kind, r.ident, r.severity) for r in records],
         )
-    ]
-    for row in rows:
-        lines.append("  ".join(value.ljust(width) for value, width in zip(row, widths)))
-    return lines
+        connection.execute(
+            "INSERT INTO meta (key, value) VALUES ('last_run', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (when,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+Item = TypeVar("Item")
+
+
+def _only_new(
+    items: Sequence[Item], to_record: Callable[[Item], Record], fingerprints: set[str]
+) -> list[Item]:
+    """Keep the items whose snapshot fingerprint was not already stored."""
+    return [item for item in items if to_record(item).fingerprint in fingerprints]
+
+
+def _tally(severities: Iterable[str]) -> str:
+    """Render ``3 CRITICAL, 8 HIGH`` for the severities present, worst first."""
+    counts: dict[str, int] = {}
+    for severity in severities:
+        counts[severity] = counts.get(severity, 0) + 1
+    return ", ".join(f"{counts[sev]} {sev}" for sev in SEVERITY_ORDER if sev in counts)
+
+
+def _suffix(severities: Sequence[str]) -> str:
+    """A `` - 3 CRITICAL, 8 HIGH`` tail, empty when there is nothing to tally."""
+    tally = _tally(severities)
+    return f" - {tally}" if tally else ""
 
 
 def render(
@@ -658,14 +823,27 @@ def render(
     routes: Sequence[Route],
     scan: Scan,
     detail_limit: int,
+    drift: Drift,
 ) -> str:
-    """Format the terminal report: wildcard table, primitives, reachability, totals."""
+    """Format the terminal report: what is new, what was fixed, what stands.
+
+    The three tables are already filtered to this run's new rows; on a first
+    run that is every row, and the report reads exactly as it did before the
+    baseline existed.
+    """
+    fresh = drift.previous_run is not None
+    recorded = len(findings) + len(escalations) + len(routes)
+
     lines = [
-        "IAM PRIVILEGE ESCALATION LINT - phase 3 "
-        "(wildcard audit + escalation primitives + reachability)",
+        "IAM PRIVILEGE ESCALATION LINT - phase 4 "
+        "(wildcard audit + escalation primitives + reachability + baseline drift)",
         f"scanned {scan.files} policy files | {scan.statements} statements | {scan.allows} Allow",
-        "",
     ]
+    if fresh:
+        lines.append(f"baseline {drift.baseline} | compared against {drift.previous_run}")
+    else:
+        lines.append(f"baseline {drift.baseline} initialised - {recorded} findings recorded")
+    lines.append("")
 
     if findings:
         rows = [
@@ -697,7 +875,9 @@ def render(
                 )
                 lines.append("  " + json.dumps(finding.statement))
     else:
-        lines.append("no over-broad Allow statements found")
+        lines.append(
+            "no new over-broad Allow statements" if fresh else "no over-broad Allow statements found"
+        )
 
     lines.append("")
     lines.append("--- escalation paths (role -> administrator) ---")
@@ -711,7 +891,9 @@ def render(
                 f"{escalation.reason}"
             )
     else:
-        lines.append("no role holds a known escalation primitive")
+        lines.append(
+            "no new escalation paths" if fresh else "no role holds a known escalation primitive"
+        )
 
     lines.append("")
     lines.append("--- reachability (role -> role) ---")
@@ -726,35 +908,50 @@ def render(
                 f"{len(route.hops) - 1:>4}  {chain} ({route.reason})"
             )
     else:
-        lines.append("no role reaches an admin-equivalent role through assume")
+        lines.append(
+            "no new assume routes to administrator"
+            if fresh
+            else "no role reaches an admin-equivalent role through assume"
+        )
 
-    tally = {sev: sum(1 for f in findings if f.severity == sev) for sev in SEVERITY_ORDER}
-    summary = ", ".join(f"{count} {sev}" for sev, count in tally.items() if count)
-
-    esc_tally = {sev: sum(1 for e in escalations if e.severity == sev) for sev in SEVERITY_ORDER}
-    esc_summary = ", ".join(f"{count} {sev}" for sev, count in esc_tally.items() if count)
-
-    route_tally = {sev: sum(1 for r in routes if r.severity == sev) for sev in SEVERITY_ORDER}
-    route_summary = ", ".join(f"{count} {sev}" for sev, count in route_tally.items() if count)
+    if drift.fixed:
+        lines.append("")
+        lines.append(f"--- fixed since {drift.previous_run} ---")
+        sev_w = max(len("SEV"), max(len(severity) for _, _, severity in drift.fixed))
+        kind_w = max(len("KIND"), max(len(kind) for kind, _, _ in drift.fixed))
+        lines.append(f"{'SEV':<{sev_w}}  {'KIND':<{kind_w}}  WHAT")
+        for kind, ident, severity in drift.fixed:
+            lines.append(f"{severity:<{sev_w}}  {kind:<{kind_w}}  {ident}")
 
     lines.append("")
-    lines.append(f"{len(findings)} findings" + (f" - {summary}" if summary else ""))
-    lines.append(
-        f"{len(escalations)} escalation paths" + (f" - {esc_summary}" if esc_summary else "")
-    )
-    lines.append(
-        f"{len(routes)} assume routes to administrator"
-        + (f" - {route_summary}" if route_summary else "")
-    )
+    if fresh and not recorded:
+        lines.append(
+            f"nothing new since {drift.previous_run} - "
+            f"{len(drift.fixed)} fixed, {drift.unchanged} unchanged"
+        )
+    else:
+        mark = " new" if fresh else ""
+        lines.append(f"{len(findings)}{mark} findings" + _suffix([f.severity for f in findings]))
+        lines.append(
+            f"{len(escalations)}{mark} escalation paths"
+            + _suffix([e.severity for e in escalations])
+        )
+        lines.append(
+            f"{len(routes)}{mark} assume routes to administrator"
+            + _suffix([r.severity for r in routes])
+        )
+        if fresh:
+            lines.append(f"{len(drift.fixed)} fixed, {drift.unchanged} unchanged")
     return "\n".join(lines)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Parse arguments, scan the policy directory and print the report."""
+    """Parse arguments, scan the policy directory, print the drift and re-record it."""
     parser = argparse.ArgumentParser(
         description=(
             "Report over-broad Allow statements, role-level privilege escalation "
-            "paths and assume routes to administrator in exported AWS IAM policies."
+            "paths and assume routes to administrator in exported AWS IAM policies, "
+            "compared against the last run."
         )
     )
     parser.add_argument(
@@ -767,7 +964,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--top",
         type=int,
         default=10,
-        help="how many findings to expand with their raw statement (default: 10)",
+        help="how many new findings to expand with their raw statement (default: 10)",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=str(DEFAULT_BASELINE),
+        help=f"sqlite file holding the last run's findings (default: {DEFAULT_BASELINE})",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="ignore the stored baseline and report every finding as new again",
     )
     args = parser.parse_args(argv)
 
@@ -776,13 +983,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {directory} is not a directory", file=sys.stderr)
         return 2
 
+    baseline = Path(args.baseline)
     statements, trusts, scan = load_statements(directory)
-    report = render(
-        analyze(statements),
-        find_escalations(statements),
-        find_paths(statements, trusts),
-        scan,
-        args.top,
+    findings = analyze(statements)
+    escalations = find_escalations(statements)
+    routes = find_paths(statements, trusts)
+
+    records = snapshot(findings, escalations, routes)
+    previous, last_run = ({}, None) if args.reset else load_baseline(baseline)
+    new_records, fixed, unchanged = compare(previous, records)
+    fresh = {record.fingerprint for record in new_records}
+
+    print(
+        render(
+            _only_new(findings, _finding_record, fresh),
+            _only_new(escalations, _escalation_record, fresh),
+            _only_new(routes, _route_record, fresh),
+            scan,
+            args.top,
+            Drift(
+                baseline=baseline,
+                previous_run=last_run,
+                fixed=tuple(fixed),
+                unchanged=unchanged,
+            ),
+        )
     )
-    print(report)
+
+    try:
+        save_baseline(baseline, records, datetime.now().isoformat(timespec="seconds"))
+    except sqlite3.Error as exc:
+        print(f"warning: baseline not written: {exc}", file=sys.stderr)
     return 0
