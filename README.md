@@ -55,65 +55,6 @@ and asks whether the role can reach admin in one step.
 
 | Severity | Pattern | Why it matters |
 |---|---|---|
-| CRITICAL | `iam:PassRole` plus an action that runs code as a role | `lambda:CreateFunction`, `ec2:RunInstances`, `glue:CreateDevEndpoint`, `cloudformation:CreateStack` and nine<files>
-<file name="README.md">
-# iam-escalation-lint
-
-Reads a directory of exported AWS IAM policies and prints three things: the
-over-broad Allow statements, ranked by severity, the roles that hold a known
-one-step path to administrator, and the shortest assume route from a role that
-is not admin to one that is.
-
-Every row also goes into a sqlite baseline, so the next run prints only what
-changed: the new rows in full, the rows that have gone away as fixed, and a
-count of what is unchanged.
-
-## Run
-
-    python main.py
-
-No arguments, no network, no dependencies outside the Python 3 standard
-library. It reads the sample policy set in `policies/`, prints a report and
-records it in `.iamlint-baseline.db` in the working directory.
-
-Point it at a real export by passing the directory:
-
-    python main.py ~/exports/iam-policies-2026-10-08
-
-| Flag | Effect |
-|---|---|
-| `--top N` | how many new findings get their raw statement printed (default 10) |
-| `--baseline FILE` | where the snapshot lives (default `.iamlint-baseline.db`) |
-| `--reset` | ignore the stored snapshot and report every finding as new again |
-
-## What it finds
-
-### Over-broad Allow statements
-
-| Severity | Pattern | Why it matters |
-|---|---|---|
-| CRITICAL | `Action: "*"` with `Resource: "*"` | Full administrator. |
-| CRITICAL | `NotAction` with `Resource: "*"` | Inverted logic: permits every action except the short excluded list. |
-| HIGH | `Action: "*"` on a scoped resource | Every action, including the ones AWS adds next quarter. |
-| HIGH | `iam:*`, `sts:*`, `kms:*` | Service-wide control of a privilege-bearing service. |
-| HIGH | `s3:*` with `Resource: "*"` | Service-wide control of every bucket in the account. |
-| HIGH | A named action on `*` under `iam`/`sts`/`kms` | Narrow action, no resource scope. `iam:PassRole` on `*` is an escalation primitive. |
-| HIGH | `NotResource` on an Allow | Permits every resource except the excluded prefix. |
-| MEDIUM | `dynamodb:*` on one table | Service-wide, but scoped to one resource. |
-| MEDIUM | Named write actions on `*` | No resource scoping. |
-| LOW | `s3:Get*`, `s3:List*` | Read-only wildcard. Tolerable, still worth knowing. |
-
-Deny statements are counted and skipped here. `NotAction: "*"` grants nothing
-and is skipped too.
-
-### Escalation paths
-
-A statement can look harmless on its own and still be the first step to
-administrator. This second pass reads every statement a role holds together
-and asks whether the role can reach admin in one step.
-
-| Severity | Pattern | Why it matters |
-|---|---|---|
 | CRITICAL | `iam:PassRole` plus an action that runs code as a role | `lambda:CreateFunction`, `ec2:RunInstances`, `glue:CreateDevEndpoint`, `cloudformation:CreateStack` and ten more. Pass a role, run code as it. |
 | HIGH | Any one identity-writing primitive | `iam:CreatePolicyVersion`, `iam:AttachRolePolicy`, `iam:UpdateAssumeRolePolicy`, `iam:AddUserToGroup`, `sts:AssumeRole` and eight more. |
 
