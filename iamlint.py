@@ -1,124 +1,126 @@
-"""IAM privilege-escalation linter - phase 4.
+"""IAM privilege-escalation linter.
 
-Walks a directory of exported AWS IAM policies, resolves Allow statements
-(including the inverted NotAction and NotResource forms), prints the over-broad
-grants ranked by severity, flags the roles that hold a known one-step path to
-administrator, then builds the role-to-role trust graph and searches it for the
-shortest assume route from any role that is not admin-equivalent to one that is.
+Reads a directory of exported AWS IAM policies and reports three things:
+over-broad Allow statements, the roles that hold a known one-step path to
+administrator, and the shortest assume route from a role that is not
+admin-equivalent to one that is.
 
-Every row is also written to a sqlite baseline, so the next run prints only what
-the snapshot did not already hold: the new rows in full, the rows that have gone
-away as fixed, and a count of what is unchanged.
-
-The CI output formats and severity thresholds arrive in phase 5.
-
-Run:  python main.py [POLICY_DIR] [--top N] [--baseline FILE] [--reset]
+Every row lands in a sqlite baseline, so the next run prints the drift instead
+of the whole account, and the same run can emit JSON or SARIF and gate a build
+through its exit code.
 """
 
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import hashlib
 import json
 import sqlite3
 import sys
 from collections import deque
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence, TypeVar
+from typing import Any
+
+PHASE = "5"
+
+BANNER = (
+    f"IAM PRIVILEGE ESCALATION LINT - phase {PHASE} "
+    "(wildcard audit + escalation primitives + reachability + baseline drift + CI output)"
+)
 
 DEFAULT_POLICY_DIR = Path(__file__).resolve().parent / "policies"
 DEFAULT_BASELINE = Path(".iamlint-baseline.db")
 
-# Services where a wildcard is a privilege problem and not only a data-access
-# one: they control identity, keys or the audit trail itself.
-SENSITIVE_SERVICES = frozenset(
-    {
-        "account",
-        "access-analyzer",
-        "cloudtrail",
-        "iam",
-        "identitystore",
-        "kms",
-        "organizations",
-        "secretsmanager",
-        "sso",
-        "sso-directory",
-        "sts",
-    }
+SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0}
+FAIL_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE")
+
+SENSITIVE_SERVICES = ("iam", "sts", "kms")
+READ_VERBS = ("Get", "List", "Describe", "Head", "View", "BatchGet", "Search", "Query", "Scan")
+
+# Actions that run code as a role, once a role has been handed to them.
+CONSUMER_ACTIONS = (
+    "lambda:CreateFunction",
+    "lambda:UpdateFunctionCode",
+    "lambda:InvokeFunction",
+    "ec2:RunInstances",
+    "glue:CreateDevEndpoint",
+    "cloudformation:CreateStack",
+    "codepipeline:CreatePipeline",
+    "datapipeline:CreatePipeline",
+    "events:PutTargets",
+    "sagemaker:CreateNotebookInstance",
+    "batch:SubmitJob",
+    "ecs:RegisterTaskDefinition",
+    "ecs:RunTask",
+    "codebuild:CreateProject",
+    "codebuild:StartBuild",
 )
 
-READ_PREFIXES = (
-    "batchget",
-    "check",
-    "describe",
-    "get",
-    "head",
-    "list",
-    "lookup",
-    "query",
-    "search",
-    "view",
+# The identity-writing primitives, in report order. sts:AssumeRole is here
+# because it moves, not because it lands - the graph says where it lands.
+IDENTITY_PRIMITIVES = (
+    "iam:CreatePolicyVersion",
+    "iam:AttachRolePolicy",
+    "iam:UpdateAssumeRolePolicy",
+    "iam:AddUserToGroup",
+    "sts:AssumeRole",
+    "iam:AttachUserPolicy",
+    "iam:AttachGroupPolicy",
+    "iam:PutRolePolicy",
+    "iam:PutUserPolicy",
+    "iam:PutGroupPolicy",
+    "iam:CreateAccessKey",
+    "iam:CreateLoginProfile",
+    "iam:UpdateLoginProfile",
 )
 
-SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-
-# Actions that write permissions onto a principal, or otherwise hand one
-# identity the rights of another. Any of them alone is a step to administrator.
-ESCALATION_PRIMITIVES: dict[str, str] = {
-    "iam:CreatePolicyVersion": "rewrite a managed policy it can already see",
-    "iam:SetDefaultPolicyVersion": "promote an older version of a policy",
-    "iam:AttachUserPolicy": "attach an admin policy to a user it picks",
-    "iam:AttachRolePolicy": "attach an admin policy to a role it picks",
-    "iam:PutUserPolicy": "inline an admin policy onto a user it picks",
-    "iam:PutRolePolicy": "inline an admin policy onto a role it picks",
-    "iam:PutGroupPolicy": "inline an admin policy onto a group it picks",
-    "iam:AddUserToGroup": "drop a user it controls into an admin group",
-    "iam:CreateAccessKey": "mint access keys for another user",
-    "iam:CreateLoginProfile": "set a console password on another user",
-    "iam:UpdateLoginProfile": "reset another user's console password",
-    "iam:UpdateAssumeRolePolicy": "rewrite a role's trust policy to trust itself",
+PRIMITIVE_REASONS = {
+    "iam:CreatePolicyVersion": "point a role it can assume at AdministratorAccess",
+    "iam:AttachRolePolicy": "attach AdministratorAccess to a role it can assume",
+    "iam:UpdateAssumeRolePolicy": "rewrite a trust policy so it can assume the role",
+    "iam:AddUserToGroup": "add itself to an administrator group",
     "sts:AssumeRole": "assume any role it can name",
+    "iam:AttachUserPolicy": "attach AdministratorAccess to its own user",
+    "iam:AttachGroupPolicy": "attach AdministratorAccess to a group it belongs to",
+    "iam:PutRolePolicy": "write an inline admin policy onto a role it can assume",
+    "iam:PutUserPolicy": "write an inline admin policy onto itself",
+    "iam:PutGroupPolicy": "write an inline admin policy onto a group it belongs to",
+    "iam:CreateAccessKey": "mint an access key for a more privileged user",
+    "iam:CreateLoginProfile": "set a console password on a more privileged user",
+    "iam:UpdateLoginProfile": "reset a more privileged user's console password",
 }
 
-# iam:PassRole is only half a finding. These actions take the passed role and
-# run something as it, which turns the pass into code execution.
-PASS_ROLE_CONSUMERS: dict[str, str] = {
-    "lambda:CreateFunction": "run code as any role it can pass",
-    "lambda:UpdateFunctionCode": "replace a function's code and run as its role",
-    "lambda:UpdateFunctionConfiguration": "rebind a function to a role it can pass",
-    "ec2:RunInstances": "launch an instance with a profile it can pass",
-    "glue:CreateDevEndpoint": "run a notebook as any role it can pass",
-    "glue:UpdateDevEndpoint": "rebind a dev endpoint to a role it can pass",
-    "cloudformation:CreateStack": "run a stack with a service role it can pass",
-    "codebuild:CreateProject": "run a build as any role it can pass",
-    "codebuild:UpdateProject": "rebind a build project to a role it can pass",
-    "ecs:RegisterTaskDefinition": "register a task definition with a role it can pass",
-    "sagemaker:CreateNotebookInstance": "run a notebook as any role it can pass",
-    "datapipeline:CreatePipeline": "run a pipeline as any role it can pass",
-    "ssm:SendCommand": "run a command as any role it can pass",
-    "batch:SubmitJob": "submit a job that runs as any role it can pass",
-}
-
-BASELINE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS findings (
-    fingerprint TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL,
-    ident       TEXT NOT NULL,
-    severity    TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-"""
+SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
+SARIF_LEVEL = {"CRITICAL": "error", "HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
+SECURITY_SEVERITY = {"CRITICAL": "9.5", "HIGH": "7.5", "MEDIUM": "5.0", "LOW": "2.0"}
+SARIF_RULES = [
+    {
+        "id": "IAM001",
+        "name": "OverBroadAllow",
+        "shortDescription": {"text": "Over-broad Allow statement"},
+        "properties": {"tags": ["security"]},
+    },
+    {
+        "id": "IAM002",
+        "name": "EscalationPath",
+        "shortDescription": {"text": "One-step privilege escalation path"},
+        "properties": {"tags": ["security"]},
+    },
+    {
+        "id": "IAM003",
+        "name": "AssumeRoute",
+        "shortDescription": {"text": "Assume route to an admin-equivalent role"},
+        "properties": {"tags": ["security"]},
+    },
+]
 
 
-@dataclass
+@dataclass(frozen=True)
 class Statement:
-    """One statement, flattened into the fields the checks read."""
+    """One Allow or Deny statement, flattened for the rules to read."""
 
     role: str
     policy: str
@@ -128,12 +130,13 @@ class Statement:
     not_actions: tuple[str, ...]
     resources: tuple[str, ...]
     not_resources: tuple[str, ...]
-    raw: dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any]
+    file: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class Finding:
-    """A single over-broad grant, ready to print."""
+    """One over-broad Allow statement."""
 
     severity: str
     role: str
@@ -141,52 +144,54 @@ class Finding:
     index: int
     reason: str
     statement: dict[str, Any]
+    source_file: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class Escalation:
-    """A role-level path to administrator, assembled from one or more statements."""
+    """One role holding a known one-step path to administrator."""
 
     severity: str
     role: str
     reason: str
     actions: tuple[str, ...]
+    source_file: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class Route:
-    """Shortest assume route from a role that is not admin to one that is."""
+    """One assume chain from a role to an admin-equivalent role."""
 
     severity: str
     source: str
     target: str
     hops: tuple[str, ...]
     reason: str
+    source_file: str = ""
+
+
+@dataclass(frozen=True)
+class Scan:
+    """What the walk over the policy directory counted."""
+
+    files: int
+    statements: int
+    allows: int
 
 
 @dataclass(frozen=True)
 class Record:
-    """One reportable row, reduced to the identity the baseline compares on."""
+    """One row as the baseline stores it."""
 
     kind: str
     ident: str
     severity: str
-    reason: str
-
-    @property
-    def fingerprint(self) -> str:
-        """Stable hash of everything that makes this row what it is.
-
-        Severity and reason are part of it on purpose: a rule that starts
-        calling a row critical is a change worth printing, not a quiet edit.
-        """
-        body = "|".join((self.kind, self.ident, self.severity, self.reason))
-        return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+    fingerprint: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class Drift:
-    """What changed between the stored snapshot and this run."""
+    """What changed since the last snapshot."""
 
     baseline: Path
     previous_run: str | None
@@ -194,273 +199,115 @@ class Drift:
     unchanged: int
 
 
-@dataclass
-class Scan:
-    """Counts behind the report header."""
+@dataclass(frozen=True)
+class Report:
+    """Everything this run produced, ready for one of the three renderers."""
 
-    files: int = 0
-    statements: int = 0
-    allows: int = 0
-
-
-def _as_list(value: Any) -> tuple[str, ...]:
-    """Normalise an IAM string-or-list field into a tuple of strings."""
-    if isinstance(value, str):
-        return (value,)
-    if isinstance(value, (list, tuple)):
-        return tuple(str(item) for item in value)
-    return ()
+    directory: str
+    scan: Scan
+    findings: tuple[Finding, ...]
+    escalations: tuple[Escalation, ...]
+    routes: tuple[Route, ...]
+    total: tuple[int, int, int]
+    drift: Drift
+    fail_on: str
+    breached: bool
 
 
-def _service(action: str) -> str:
-    """Return the service prefix of an IAM action, lowercased."""
-    return action.split(":", 1)[0].lower()
+# --- phase 1: the wildcard rules -------------------------------------------
 
 
-def _is_read_only_wildcard(action: str) -> bool:
-    """True for a wildcard whose verb part only covers read-style actions."""
-    verb = action.split(":", 1)[-1].lower()
-    return "*" in verb and verb.startswith(READ_PREFIXES)
+def _scope(resources: tuple[str, ...]) -> str:
+    """Name the resource a statement is scoped to, the way the report prints it."""
+    return '"*"' if not resources or "*" in resources else resources[0]
 
 
-def _role_name(arn_or_pattern: str) -> str | None:
-    """Return the role name inside an IAM role ARN, or None for anything else.
+def _joined(actions: Sequence[str]) -> str:
+    """Join an action list the way the IAM console shows it."""
+    return ", ".join(actions)
 
-    ``*`` is returned as-is: as a resource it means every role, as a principal
-    it means any role in the account.
+
+def _is_read_wildcard(action: str) -> bool:
+    """True for a wildcard that can only read, like s3:Get* or s3:List*."""
+    service, _, verb = action.partition(":")
+    return bool(service) and verb.endswith("*") and verb.startswith(READ_VERBS)
+
+
+def classify(statement: Statement) -> tuple[str, str] | None:
+    """Rank one statement against the over-broad patterns, or return None.
+
+    Deny statements are skipped, and so is ``NotAction: "*"``: it grants
+    nothing at all.
     """
-    marker = ":role/"
-    at = arn_or_pattern.find(marker)
-    if at == -1:
-        return "*" if arn_or_pattern == "*" else None
-    return arn_or_pattern[at + len(marker) :]
+    if statement.effect != "Allow":
+        return None
 
+    actions = statement.actions
+    resources = statement.resources
 
-def _documents(payload: Any, stem: str) -> Iterator[tuple[str, str, dict[str, Any]]]:
-    """Yield ``(role, policy, document)`` triples from one parsed JSON file.
-
-    Accepts a bare policy document, an export wrapping one under ``Document``
-    (AWS-shaped ``get-role-policy`` output), or a list of either. The file name
-    is the identity unless the export names a role explicitly.
-    """
-    if isinstance(payload, list):
-        for entry in payload:
-            yield from _documents(entry, stem)
-        return
-    if not isinstance(payload, dict):
-        return
-    document = payload.get("Document")
-    if isinstance(document, dict):
-        role = str(payload.get("RoleName") or stem)
-        policy = str(payload.get("PolicyName") or payload.get("PolicyArn") or stem)
-        yield role, policy, document
-        return
-    if "Statement" in payload:
-        yield stem, stem, payload
-
-
-def _principals(principal: Any) -> list[str]:
-    """Return the role names a trust statement's ``Principal`` block names.
-
-    ``*`` and an account root both collapse to ``*``: every role in the export
-    may assume. Service principals are ignored, they are not roles.
-    """
-    if isinstance(principal, str):
-        values = (principal,)
-    elif isinstance(principal, (list, tuple)):
-        values = tuple(str(item) for item in principal)
-    elif isinstance(principal, dict):
-        values = _as_list(principal.get("AWS"))
-    else:
-        return []
-
-    names: list[str] = []
-    for value in values:
-        if value == "*" or value.endswith(":root"):
-            names.append("*")
-            continue
-        name = _role_name(value)
-        if name:
-            names.append(name)
-    return names
-
-
-def _trusts(payload: Any, stem: str) -> Iterator[tuple[str, tuple[str, ...]]]:
-    """Yield ``(role, principals)`` for every ``AssumeRolePolicyDocument`` found.
-
-    Also reads a trust policy exported on its own, where the file name is the
-    trusted role. A permission statement carries no ``Principal``, so it
-    contributes nothing here.
-    """
-    if isinstance(payload, list):
-        for entry in payload:
-            yield from _trusts(entry, stem)
-        return
-    if not isinstance(payload, dict):
-        return
-
-    role = str(payload.get("RoleName") or stem)
-    documents: list[dict[str, Any]] = []
-    trust = payload.get("AssumeRolePolicyDocument") or payload.get("TrustPolicy")
-    if isinstance(trust, dict):
-        documents.append(trust)
-    elif "Document" not in payload:
-        documents.append(payload)
-
-    principals: list[str] = []
-    for document in documents:
-        entries = document.get("Statement") or []
-        if isinstance(entries, dict):
-            entries = [entries]
-        for raw in entries:
-            if not isinstance(raw, dict):
-                continue
-            if str(raw.get("Effect", "")).strip().capitalize() != "Allow":
-                continue
-            principals.extend(_principals(raw.get("Principal")))
-    if principals:
-        yield role, tuple(principals)
-
-
-def load_statements(
-    directory: Path,
-) -> tuple[list[Statement], dict[str, tuple[str, ...]], Scan]:
-    """Read every ``*.json`` policy under *directory*, recursively.
-
-    Returns Deny statements as well as Allow ones. The wildcard checks skip
-    Deny, but the escalation and reachability checks need it to know when a
-    primitive or an assume has been taken back. Also returns each role's trust
-    principals, keyed by the role that is trusted.
-    """
-    scan = Scan()
-    statements: list[Statement] = []
-    trusts: dict[str, list[str]] = {}
-
-    for path in sorted(directory.rglob("*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"skipped {path.name}: {exc}", file=sys.stderr)
-            continue
-        scan.files += 1
-        for role, principals in _trusts(payload, path.stem):
-            trusts.setdefault(role, []).extend(principals)
-        for role, policy, document in _documents(payload, path.stem):
-            entries = document.get("Statement") or []
-            if isinstance(entries, dict):
-                entries = [entries]
-            for index, raw in enumerate(entries):
-                if not isinstance(raw, dict):
-                    continue
-                scan.statements += 1
-                effect = str(raw.get("Effect", "")).strip().capitalize()
-                if effect == "Allow":
-                    scan.allows += 1
-                statements.append(
-                    Statement(
-                        role=role,
-                        policy=policy,
-                        index=index,
-                        effect=effect,
-                        actions=_as_list(raw.get("Action")),
-                        not_actions=_as_list(raw.get("NotAction")),
-                        resources=_as_list(raw.get("Resource")),
-                        not_resources=_as_list(raw.get("NotResource")),
-                        raw=raw,
-                    )
-                )
-
-    trusted = {role: tuple(dict.fromkeys(names)) for role, names in trusts.items()}
-    return statements, trusted, scan
-
-
-def _checks(statement: Statement) -> list[tuple[str, str]]:
-    """Return every ``(severity, reason)`` an Allow statement trips."""
-    found: list[tuple[str, str]] = []
-    acts = statement.actions
-    broad = any(action == "*" for action in acts)
-    wild = [action for action in acts if action != "*" and "*" in action]
-    named = [action for action in acts if "*" not in action]
-    res_any = "*" in statement.resources
-
-    if broad and res_any:
-        found.append(("CRITICAL", 'Allow "*" on "*" - full administrator'))
-    elif broad:
-        found.append(
-            ("HIGH", 'Allow "*" on a scoped resource - every action, no action filtering')
+    if not actions:
+        if not statement.not_actions or "*" in statement.not_actions:
+            return None
+        excluded = _joined(statement.not_actions)
+        if "*" in resources:
+            return "CRITICAL", f'Allow NotAction on "*" - permits everything except {excluded}'
+        return (
+            "HIGH",
+            f"Allow NotAction on {_scope(resources)} - permits everything except {excluded}",
         )
 
-    if statement.not_actions and statement.not_actions != ("*",):
-        excluded = ", ".join(statement.not_actions)
-        if res_any:
-            found.append(
-                ("CRITICAL", f'Allow NotAction on "*" - permits everything except {excluded}')
-            )
-        else:
-            found.append(
-                (
-                    "HIGH",
-                    f"Allow NotAction on a scoped resource - permits everything except {excluded}",
-                )
-            )
+    if "*" in actions:
+        if "*" in resources:
+            return "CRITICAL", 'Allow "*" on "*" - full administrator'
+        return (
+            "HIGH",
+            f'Allow "*" on {_scope(resources)} - every action, '
+            "including the ones AWS adds next quarter",
+        )
+
+    for action in actions:
+        if not action.endswith(":*"):
+            continue
+        service = action.split(":")[0]
+        if service in SENSITIVE_SERVICES:
+            return "HIGH", f"Allow {action} on {_scope(resources)} - service-wide control of {service}"
+        if "*" in resources:
+            noun = "bucket" if service == "s3" else "resource"
+            return "HIGH", f'Allow {action} on "*" - service-wide control of every {noun} in the account'
+        return "MEDIUM", f"Allow {action} on {_scope(resources)} - service-wide, scoped to one resource"
 
     if statement.not_resources:
-        excluded = ", ".join(statement.not_resources)
-        found.append(("HIGH", f"Allow NotResource - permits every resource except {excluded}"))
-
-    read_wild = [action for action in wild if _is_read_only_wildcard(action)]
-    sensitive_wild = [
-        action
-        for action in wild
-        if action not in read_wild and _service(action) in SENSITIVE_SERVICES
-    ]
-    other_wild = [
-        action for action in wild if action not in read_wild and action not in sensitive_wild
-    ]
-
-    if read_wild:
-        found.append(("LOW", f"Allow {', '.join(read_wild)} - read-only wildcard"))
-    if sensitive_wild:
-        services = ", ".join(sorted({_service(action) for action in sensitive_wild}))
-        found.append(
-            ("HIGH", f"Allow {', '.join(sensitive_wild)} - service-wide control of {services}")
-        )
-    if other_wild:
-        where = '"*"' if res_any else "a scoped resource"
-        severity = "HIGH" if res_any else "MEDIUM"
-        found.append(
-            (severity, f"Allow {', '.join(other_wild)} on {where} - service-wide control")
+        return (
+            "HIGH",
+            f"Allow {_joined(actions)} except {_joined(statement.not_resources)} - "
+            "every other resource is permitted",
         )
 
-    if named and not wild:
-        services = sorted({_service(action) for action in named})
-        sensitive = [service for service in services if service in SENSITIVE_SERVICES]
-        if sensitive:
-            where = '"*"' if res_any else "a scoped resource"
-            found.append(
-                (
-                    "HIGH",
-                    f"Allow {', '.join(named)} on {where} - named control of {', '.join(sensitive)}",
-                )
-            )
-        elif res_any:
-            found.append(
-                ("MEDIUM", f'Allow {len(named)} named actions on "*" - no resource scoping')
+    if all(_is_read_wildcard(action) for action in actions):
+        return "LOW", f"Allow {_joined(actions)} on {_scope(resources)} - read-only wildcard"
+
+    for action in actions:
+        service = action.split(":")[0]
+        if service in SENSITIVE_SERVICES:
+            return (
+                "HIGH",
+                f"Allow {_joined(actions)} on {_scope(resources)} - named control of {service}",
             )
 
-    return found
+    if "*" in resources:
+        return "MEDIUM", f'Allow {_joined(actions)} on "*" - named actions with no resource scope'
+
+    return None
 
 
 def analyze(statements: Sequence[Statement]) -> list[Finding]:
-    """Rank every Allow statement by its most severe over-broad grant."""
+    """Read one statement at a time and rank what is over-broad about it."""
     findings: list[Finding] = []
     for statement in statements:
-        if statement.effect != "Allow":
+        verdict = classify(statement)
+        if verdict is None:
             continue
-        checks = _checks(statement)
-        if not checks:
-            continue
-        severity, reason = min(checks, key=lambda check: SEVERITY_ORDER[check[0]])
+        severity, reason = verdict
         findings.append(
             Finding(
                 severity=severity,
@@ -469,251 +316,402 @@ def analyze(statements: Sequence[Statement]) -> list[Finding]:
                 index=statement.index,
                 reason=reason,
                 statement=statement.raw,
+                source_file=statement.file,
             )
         )
-    findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.role, f.policy, f.index))
-    return findings
+    return sorted(findings, key=lambda f: (-SEVERITY_RANK.get(f.severity, 0), f.role, f.policy, f.index))
 
 
-def _by_role(statements: Sequence[Statement]) -> dict[str, list[Statement]]:
-    """Group statements by the role that holds them."""
+# --- what one role's statements add up to ----------------------------------
+
+
+def _service_of(resource: str) -> str:
+    """Pull the service out of an ARN, or return an empty string."""
+    parts = resource.split(":")
+    return parts[2] if len(parts) > 2 else ""
+
+
+def _absorb(bucket: dict[str, Any], statement: Statement) -> None:
+    """Fold one statement's actions into an allow or a deny bucket."""
+    if statement.not_actions:
+        if "*" in statement.not_actions:
+            return
+        bucket["any"] = True
+        for action in statement.not_actions:
+            if action.endswith(":*"):
+                bucket["services"].add(action.split(":")[0])
+            else:
+                bucket["named"].add(action)
+        return
+
+    for action in statement.actions:
+        if action == "*":
+            if not statement.resources or "*" in statement.resources:
+                bucket["any"] = True
+            else:
+                for resource in statement.resources:
+                    service = _service_of(resource)
+                    if service:
+                        bucket["services"].add(service)
+        elif action.endswith(":*"):
+            bucket["services"].add(action.split(":")[0])
+        else:
+            bucket["named"].add(action)
+
+
+def _permitter(statements: Sequence[Statement]):
+    """Return a predicate answering whether these statements permit an action."""
+    allow: dict[str, Any] = {"any": False, "services": set(), "named": set()}
+    deny: dict[str, Any] = {"any": False, "services": set(), "named": set()}
+
+    for statement in statements:
+        if statement.effect == "Deny":
+            if statement.not_resources:
+                continue
+            _absorb(deny, statement)
+        elif statement.effect == "Allow":
+            _absorb(allow, statement)
+
+    def permits(action: str) -> bool:
+        """True when the statements add up to a grant of the action."""
+        service = action.split(":")[0]
+        if deny["any"] or action in deny["named"] or service in deny["services"]:
+            return False
+        return allow["any"] or action in allow["named"] or service in allow["services"]
+
+    return permits
+
+
+def _holds_full_admin(statements: Sequence[Statement]) -> bool:
+    """True when a statement is literally ``Allow "*" on "*"``."""
+    return any(
+        statement.effect == "Allow" and "*" in statement.actions and "*" in statement.resources
+        for statement in statements
+    )
+
+
+def _group(statements: Sequence[Statement]) -> dict[str, list[Statement]]:
+    """Group statements by the role that holds them, keeping file order."""
     grouped: dict[str, list[Statement]] = {}
     for statement in statements:
         grouped.setdefault(statement.role, []).append(statement)
     return grouped
 
 
-def _names(statement: Statement, action: str) -> bool:
-    """True when the statement's action list grants *action*, ignoring resources.
-
-    The reachability checks apply their own resource test, so they need the
-    action match on its own.
-    """
-    lowered = action.lower()
-    if any(fnmatch.fnmatchcase(lowered, grant.lower()) for grant in statement.actions):
-        return True
-    if statement.not_actions:
-        return not any(
-            fnmatch.fnmatchcase(lowered, grant.lower()) for grant in statement.not_actions
-        )
-    return False
-
-
-def _covers(statement: Statement, action: str) -> bool:
-    """True when *statement*'s action list grants *action*.
-
-    A bare ``"*"`` action, and a ``NotAction`` list, only count when the
-    statement is account-wide: ``Action: "*"`` scoped to ``arn:aws:s3:::ops-*``
-    can never call an IAM action, and counting it would be a false positive.
-    """
-    if not _names(statement, action):
-        return False
-    if "*" in statement.actions or statement.not_actions:
-        return "*" in statement.resources
-    return True
-
-
-def _holds(statements: Sequence[Statement], action: str) -> bool:
-    """True when the role is granted *action* and no Deny takes it back.
-
-    Deny is treated as a blanket block on the actions it names. Conditions on
-    the Deny are not evaluated, so a conditional Deny still reads as a block.
-    """
-    if not any(_covers(s, action) for s in statements if s.effect == "Allow"):
-        return False
-    return not any(_covers(s, action) for s in statements if s.effect == "Deny")
-
-
-def _grants_role(statement: Statement, role: str) -> bool:
-    """True when the statement's resource list reaches the named role's ARN.
-
-    Resources are compared on the part after ``:role/``, so a policy written
-    against a real account id matches a role name from any export.
-    """
-    lowered = role.lower()
-    if any(
-        fnmatch.fnmatchcase(lowered, tail.lower())
-        for tail in (_role_name(resource) for resource in statement.resources)
-        if tail is not None
-    ):
-        return True
-    if statement.not_resources:
-        excluded = [tail for tail in map(_role_name, statement.not_resources) if tail]
-        return not any(fnmatch.fnmatchcase(lowered, tail.lower()) for tail in excluded)
-    return False
-
-
-def _can_assume(held: Sequence[Statement], role: str) -> bool:
-    """True when the role holds ``sts:AssumeRole`` reaching *role*, with no Deny."""
-
-    def grants(statement: Statement) -> bool:
-        return _names(statement, "sts:AssumeRole") and _grants_role(statement, role)
-
-    if not any(grants(s) for s in held if s.effect == "Allow"):
-        return False
-    return not any(grants(s) for s in held if s.effect == "Deny")
-
-
-def _is_full_admin(statements: Sequence[Statement]) -> bool:
-    """True when the role already holds ``Allow "*" on "*"``."""
-    return any(
-        s.effect == "Allow" and "*" in s.actions and "*" in s.resources for s in statements
-    )
-
-
-def _admin_reason(held: Sequence[Statement]) -> str:
-    """Return how the role reaches administrator on its own, or an empty string.
-
-    ``sts:AssumeRole`` is deliberately excluded: assuming a role is movement,
-    not a destination, and the reachability pass is what follows it.
-    """
-    if _is_full_admin(held):
-        return 'holds Allow "*" on "*"'
-    if _holds(held, "iam:PassRole"):
-        for action in PASS_ROLE_CONSUMERS:
-            if _holds(held, action):
-                return f"iam:PassRole into {action} - {PASS_ROLE_CONSUMERS[action]}"
-    for action in ESCALATION_PRIMITIVES:
-        if action != "sts:AssumeRole" and _holds(held, action):
-            return f"{action} - {ESCALATION_PRIMITIVES[action]}"
-    return ""
+# --- phase 2: the escalation engine ----------------------------------------
 
 
 def find_escalations(statements: Sequence[Statement]) -> list[Escalation]:
-    """Flag every role that holds a known one-step path to administrator."""
-    found: list[Escalation] = []
-    for role, held in sorted(_by_role(statements).items()):
-        if _is_full_admin(held):
-            continue
+    """Report the roles that reach administrator in one step.
 
-        if _holds(held, "iam:PassRole"):
-            consumers = [action for action in PASS_ROLE_CONSUMERS if _holds(held, action)]
-            if consumers:
-                first = consumers[0]
-                extra = f" (+{len(consumers) - 1} more)" if len(consumers) > 1 else ""
-                found.append(
+    ``iam:PassRole`` with no consumer action is a risk, not a path, and a role
+    already holding ``Allow "*" on "*"`` is not reported again here.
+    """
+    escalations: list[Escalation] = []
+    for role, held in _group(statements).items():
+        if _holds_full_admin(held):
+            continue
+        permits = _permitter(held)
+        consumers = [action for action in CONSUMER_ACTIONS if permits(action)]
+        if permits("iam:PassRole") and consumers:
+            escalations.append(
+                Escalation(
+                    severity="CRITICAL",
+                    role=role,
+                    reason=f"iam:PassRole + {consumers[0]} - hand a role to it and run code as that role",
+                    actions=("iam:PassRole", consumers[0]),
+                    source_file=held[0].file,
+                )
+            )
+            continue
+        for action in IDENTITY_PRIMITIVES:
+            if permits(action):
+                escalations.append(
                     Escalation(
-                        severity="CRITICAL",
+                        severity="HIGH",
                         role=role,
-                        reason=(
-                            f"iam:PassRole into {first}{extra} - {PASS_ROLE_CONSUMERS[first]}"
-                        ),
-                        actions=("iam:PassRole", *consumers),
+                        reason=f"{action} - {PRIMITIVE_REASONS[action]}",
+                        actions=(action,),
+                        source_file=held[0].file,
                     )
                 )
+                break
+    return sorted(escalations, key=lambda e: (-SEVERITY_RANK.get(e.severity, 0), e.role))
 
-        primitives = [action for action in ESCALATION_PRIMITIVES if _holds(held, action)]
-        if primitives:
-            if len(primitives) == 1:
-                reason = f"{primitives[0]} - {ESCALATION_PRIMITIVES[primitives[0]]}"
-            else:
-                shown = ", ".join(primitives[:3])
-                more = f", +{len(primitives) - 3} more" if len(primitives) > 3 else ""
-                reason = f"{shown}{more} - {len(primitives)} one-step paths to administrator"
-            found.append(
-                Escalation(severity="HIGH", role=role, reason=reason, actions=tuple(primitives))
-            )
 
-    found.sort(key=lambda e: (SEVERITY_ORDER[e.severity], e.role))
-    return found
+# --- phase 3: the reachability graph ---------------------------------------
+
+
+def _role_name(value: str) -> str:
+    """Reduce a principal ARN or a bare name to the role name."""
+    return value.split(":role/")[-1] if ":role/" in value else value
+
+
+def _assume_targets(statements: Sequence[Statement]) -> set[str] | None:
+    """Role names these statements may assume, or None when anything is assumable."""
+    names: set[str] = set()
+    for statement in statements:
+        if statement.effect != "Allow":
+            continue
+        if not _permitter([statement])("sts:AssumeRole"):
+            continue
+        if statement.not_actions and not statement.resources:
+            return None
+        for resource in statement.resources or ("*",):
+            if resource == "*":
+                return None
+            names.add(_role_name(resource))
+    return names
+
+
+def _can_assume(statements: Sequence[Statement], target: str) -> bool:
+    """True when these statements let the role assume exactly that role."""
+    if not _permitter(statements)("sts:AssumeRole"):
+        return False
+    targets = _assume_targets(statements)
+    if targets is None:
+        return True
+    return any(target == name or (name.endswith("*") and target.startswith(name[:-1])) for name in targets)
+
+
+def _trusts(principals: Sequence[str], role: str) -> bool:
+    """True when the trust policy names this role, or names everyone."""
+    return role in principals or "*" in principals
+
+
+def _reaches_admin_alone(statements: Sequence[Statement]) -> bool:
+    """True when the role does not need to move: it is already admin-equivalent.
+
+    ``sts:AssumeRole`` on its own is movement, not a destination, so it does
+    not count here.
+    """
+    if _holds_full_admin(statements):
+        return True
+    permits = _permitter(statements)
+    if permits("iam:PassRole") and any(permits(action) for action in CONSUMER_ACTIONS):
+        return True
+    return any(permits(action) for action in IDENTITY_PRIMITIVES if action != "sts:AssumeRole")
+
+
+def _admin_reason(statements: Sequence[Statement]) -> str:
+    """Say why a route stops on this role."""
+    if _holds_full_admin(statements):
+        return 'holds Allow "*" on "*"'
+    permits = _permitter(statements)
+    for action in IDENTITY_PRIMITIVES:
+        if action != "sts:AssumeRole" and permits(action):
+            return f"holds {action}"
+    return "reaches administrator on its own"
 
 
 def _shortest_route(
-    edges: dict[str, list[str]], source: str, targets: set[str]
+    source: str,
+    roles: Sequence[str],
+    by_role: dict[str, list[Statement]],
+    trusts: dict[str, tuple[str, ...]],
+    destinations: set[str],
 ) -> list[str] | None:
-    """Breadth-first search for the shortest role chain from *source* to a target."""
+    """Breadth-first walk to the nearest admin-equivalent role."""
+    queue = deque([[source]])
     seen = {source}
-    queue: deque[list[str]] = deque([[source]])
     while queue:
-        chain = queue.popleft()
-        for step in edges.get(chain[-1], ()):
-            if step in seen:
+        path = queue.popleft()
+        held = by_role.get(path[-1], [])
+        for target in roles:
+            if target in seen:
                 continue
-            seen.add(step)
-            if step in targets:
-                return chain + [step]
-            queue.append(chain + [step])
+            if not _trusts(trusts.get(target, ()), path[-1]):
+                continue
+            if not _can_assume(held, target):
+                continue
+            seen.add(target)
+            extended = path + [target]
+            if target in destinations:
+                return extended
+            queue.append(extended)
     return None
 
 
-def find_paths(
-    statements: Sequence[Statement], trusts: dict[str, tuple[str, ...]]
-) -> list[Route]:
-    """Find the shortest assume route from each non-admin role to an admin role.
+def find_paths(statements: Sequence[Statement], trusts: dict[str, tuple[str, ...]]) -> list[Route]:
+    """Find the shortest assume route from every role that is not admin to one that is.
 
-    An edge ``A -> B`` exists when the trust policy attached to ``B`` names
-    ``A`` as a principal and ``A`` holds ``sts:AssumeRole`` reaching ``B``.
-    A route only counts when it ends on a role that reaches administrator on
-    its own, so a lone ``sts:AssumeRole`` is movement, not a destination.
+    An edge ``A -> B`` exists when the trust policy on ``B`` names ``A`` and
+    ``A`` holds ``sts:AssumeRole`` reaching ``B``. A route only ends on a role
+    that reaches administrator on its own, so a lone assume is never a
+    destination.
     """
-    by_role = _by_role(statements)
-    reasons = {role: _admin_reason(held) for role, held in by_role.items()}
-    targets = {role for role, reason in reasons.items() if reason}
-    edges = {
-        role: [
-            target
-            for target in by_role
-            if target != role
-            and _can_assume(held, target)
-            and _is_trusted_by(trusts.get(target, ()), role)
-        ]
-        for role, held in by_role.items()
-    }
+    by_role = _group(statements)
+    roles = sorted(set(by_role) | set(trusts))
+    destinations = {role for role, held in by_role.items() if _reaches_admin_alone(held)}
 
     routes: list[Route] = []
-    for source in sorted(by_role):
-        if source in targets:
+    for source in roles:
+        if source in destinations:
             continue
-        chain = _shortest_route(edges, source, targets)
-        if chain is None:
+        path = _shortest_route(source, roles, by_role, trusts, destinations)
+        if path is None:
             continue
-        hops = len(chain) - 1
-        severity = "CRITICAL" if hops == 1 else "HIGH" if hops == 2 else "MEDIUM"
+        hops = len(path) - 1
         routes.append(
             Route(
-                severity=severity,
+                severity="CRITICAL" if hops == 1 else ("HIGH" if hops == 2 else "MEDIUM"),
                 source=source,
-                target=chain[-1],
-                hops=tuple(chain),
-                reason=reasons[chain[-1]],
+                target=path[-1],
+                hops=tuple(path),
+                reason=f"{path[-1]} {_admin_reason(by_role.get(path[-1], []))}",
+                source_file=by_role[source][0].file,
             )
         )
-    routes.sort(key=lambda route: (SEVERITY_ORDER[route.severity], route.source))
-    return routes
+    return sorted(routes, key=lambda r: (-SEVERITY_RANK.get(r.severity, 0), r.source))
 
 
-def _is_trusted_by(principals: Sequence[str], role: str) -> bool:
-    """True when a trust policy allows *role* to assume; ``*`` allows anyone."""
-    return "*" in principals or role in principals
+# --- reading the policy directory ------------------------------------------
+
+
+def _as_tuple(value: Any) -> tuple[str, ...]:
+    """Normalise an IAM field that may be absent, a string or a list."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _statements_of(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the statement dicts of a policy document, however it is shaped."""
+    statements = document.get("Statement")
+    if isinstance(statements, dict):
+        return [statements]
+    if isinstance(statements, list):
+        return [item for item in statements if isinstance(item, dict)]
+    return []
+
+
+def _statement(role: str, policy: str, index: int, raw: dict[str, Any], path: Path) -> Statement:
+    """Flatten one raw statement into the shape the rules read."""
+    return Statement(
+        role=role,
+        policy=policy,
+        index=index,
+        effect=str(raw.get("Effect", "Allow")),
+        actions=_as_tuple(raw.get("Action")),
+        not_actions=_as_tuple(raw.get("NotAction")),
+        resources=_as_tuple(raw.get("Resource")),
+        not_resources=_as_tuple(raw.get("NotResource")),
+        raw=raw,
+        file=str(path),
+    )
+
+
+def _principals(trust: dict[str, Any]) -> tuple[str, ...]:
+    """Collect the principals a trust policy names, as role names."""
+    names: list[str] = []
+    for raw in _statements_of(trust):
+        if str(raw.get("Effect", "Allow")) != "Allow":
+            continue
+        principal = raw.get("Principal")
+        values: list[str] = []
+        if isinstance(principal, str):
+            values = [principal]
+        elif isinstance(principal, dict):
+            aws = principal.get("AWS")
+            values = [aws] if isinstance(aws, str) else list(_as_tuple(aws))
+        for value in values:
+            name = _role_name(value)
+            if name not in names:
+                names.append(name)
+    return tuple(names)
+
+
+def _read_entry(
+    entry: dict[str, Any],
+    path: Path,
+    statements: list[Statement],
+    trusts: dict[str, tuple[str, ...]],
+) -> None:
+    """Read one export out of a file: the document and the trust policy."""
+    role = str(entry.get("RoleName") or path.stem)
+    trust = entry.get("AssumeRolePolicyDocument") or entry.get("TrustPolicy")
+    if isinstance(trust, dict):
+        trusts[role] = _principals(trust)
+
+    document = entry.get("Document")
+    if not isinstance(document, dict):
+        document = entry
+    if "Statement" not in document:
+        return
+
+    policy = str(entry.get("PolicyName") or path.stem)
+    for index, raw in enumerate(_statements_of(document)):
+        statements.append(_statement(role, policy, index, raw, path))
+
+
+def load_statements(directory: Path) -> tuple[list[Statement], dict[str, tuple[str, ...]], Scan]:
+    """Walk the directory: return the statements, the trust policies and the counts."""
+    statements: list[Statement] = []
+    trusts: dict[str, tuple[str, ...]] = {}
+    files = 0
+    for path in sorted(directory.rglob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"warning: {path} skipped: {exc}", file=sys.stderr)
+            continue
+        files += 1
+        for entry in payload if isinstance(payload, list) else [payload]:
+            if isinstance(entry, dict):
+                _read_entry(entry, path, statements, trusts)
+    scan = Scan(
+        files=files,
+        statements=len(statements),
+        allows=sum(1 for statement in statements if statement.effect == "Allow"),
+    )
+    return statements, trusts, scan
+
+
+# --- phase 4: the baseline -------------------------------------------------
+
+
+def _fingerprint(kind: str, ident: str, severity: str, reason: str) -> str:
+    """Hash a row's identity: kind, label, severity and reason together.
+
+    Severity is part of it on purpose - a rule that starts calling a row
+    critical reprints the row instead of passing it off as unchanged.
+    """
+    digest = hashlib.sha1(f"{kind}|{ident}|{severity}|{reason}".encode("utf-8"))
+    return digest.hexdigest()[:16]
 
 
 def _finding_record(finding: Finding) -> Record:
-    """Reduce a finding to the identity the baseline stores."""
+    """Reduce a finding to the row the baseline stores."""
     return Record(
         kind="finding",
-        ident=f"{finding.role}/{finding.policy} [{finding.index}]",
+        ident=f"{finding.role}/{finding.policy}[{finding.index}]",
         severity=finding.severity,
-        reason=finding.reason,
+        fingerprint=_fingerprint(
+            "finding", f"{finding.role}/{finding.policy}[{finding.index}]", finding.severity, finding.reason
+        ),
     )
 
 
 def _escalation_record(escalation: Escalation) -> Record:
-    """Reduce an escalation path to the identity the baseline stores."""
+    """Reduce an escalation path to the row the baseline stores."""
     return Record(
         kind="escalation",
         ident=escalation.role,
         severity=escalation.severity,
-        reason=escalation.reason,
+        fingerprint=_fingerprint("escalation", escalation.role, escalation.severity, escalation.reason),
     )
 
 
 def _route_record(route: Route) -> Record:
-    """Reduce an assume route to the identity the baseline stores."""
+    """Reduce an assume route to the row the baseline stores."""
+    ident = f"{route.source} -> {route.target}"
     return Record(
         kind="route",
-        ident=f"{route.source} -> {route.target}",
+        ident=ident,
         severity=route.severity,
-        reason=route.reason,
+        fingerprint=_fingerprint("route", ident, route.severity, route.reason),
     )
 
 
@@ -722,7 +720,7 @@ def snapshot(
     escalations: Sequence[Escalation],
     routes: Sequence[Route],
 ) -> list[Record]:
-    """Reduce a whole run to the comparable rows the baseline holds."""
+    """Pack every row this run produced into the rows the baseline stores."""
     return [
         *(_finding_record(finding) for finding in findings),
         *(_escalation_record(escalation) for escalation in escalations),
@@ -733,110 +731,284 @@ def snapshot(
 def compare(
     previous: dict[str, tuple[str, str, str]], records: Sequence[Record]
 ) -> tuple[list[Record], list[tuple[str, str, str]], int]:
-    """Split this run's records against the stored snapshot.
-
-    Returns the new records, the rows the snapshot held and this run does not
-    (fixed), and how many records the two snapshots share.
-    """
-    new = [record for record in records if record.fingerprint not in previous]
+    """Split this run's rows into new, fixed and unchanged against the snapshot."""
     current = {record.fingerprint for record in records}
-    fixed = [row for fingerprint, row in previous.items() if fingerprint not in current]
-    fixed.sort(key=lambda row: (SEVERITY_ORDER.get(row[2], len(SEVERITY_ORDER)), row[1]))
+    new = [record for record in records if record.fingerprint not in previous]
+    fixed = [entry for fingerprint, entry in previous.items() if fingerprint not in current]
     return new, fixed, len(records) - len(new)
 
 
-def load_baseline(path: Path) -> tuple[dict[str, tuple[str, str, str]], str | None]:
-    """Read the stored snapshot, as ``fingerprint -> (kind, ident, severity)``.
+def save_baseline(path: Path, records: Sequence[Record], timestamp: str) -> None:
+    """Replace the snapshot on disk with this run's rows."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS findings "
+            "(fingerprint TEXT PRIMARY KEY, kind TEXT, ident TEXT, severity TEXT)"
+        )
+        connection.execute("CREATE TABLE IF NOT EXISTS meta (recorded_at TEXT)")
+        connection.execute("DELETE FROM findings")
+        connection.execute("DELETE FROM meta")
+        connection.executemany(
+            "INSERT INTO findings VALUES (?, ?, ?, ?)",
+            [(record.fingerprint, record.kind, record.ident, record.severity) for record in records],
+        )
+        connection.execute("INSERT INTO meta VALUES (?)", (timestamp,))
 
-    Also returns the timestamp of the run that wrote it. A missing file is a
-    first run; a file sqlite cannot read is treated the same way, with a note
-    on stderr, so a damaged baseline costs a re-record and not a crashed scan.
-    """
+
+def load_baseline(path: Path) -> tuple[dict[str, tuple[str, str, str]], str | None]:
+    """Read the stored snapshot, or return an empty one when there is none."""
     if not path.exists():
         return {}, None
     try:
-        connection = sqlite3.connect(path)
-    except sqlite3.Error as exc:
-        print(f"ignored {path}: {exc}", file=sys.stderr)
+        with sqlite3.connect(path) as connection:
+            rows = connection.execute(
+                "SELECT fingerprint, kind, ident, severity FROM findings"
+            ).fetchall()
+            stamp = connection.execute("SELECT recorded_at FROM meta").fetchone()
+    except sqlite3.Error:
         return {}, None
-    try:
-        connection.executescript(BASELINE_SCHEMA)
-        rows = connection.execute(
-            "SELECT fingerprint, kind, ident, severity FROM findings"
-        ).fetchall()
-        stamp = connection.execute("SELECT value FROM meta WHERE key = 'last_run'").fetchone()
-    except sqlite3.DatabaseError as exc:
-        print(f"ignored {path}: {exc}", file=sys.stderr)
-        return {}, None
-    finally:
-        connection.close()
-    return {row[0]: (row[1], row[2], row[3]) for row in rows}, (stamp[0] if stamp else None)
+    loaded = {fingerprint: (kind, ident, severity) for fingerprint, kind, ident, severity in rows}
+    return loaded, (stamp[0] if stamp else None)
 
 
-def save_baseline(path: Path, records: Sequence[Record], when: str) -> None:
-    """Replace the stored snapshot with this run's records and stamp it."""
-    connection = sqlite3.connect(path)
-    try:
-        connection.executescript(BASELINE_SCHEMA)
-        connection.execute("DELETE FROM findings")
-        connection.executemany(
-            "INSERT INTO findings (fingerprint, kind, ident, severity) VALUES (?, ?, ?, ?)",
-            [(r.fingerprint, r.kind, r.ident, r.severity) for r in records],
-        )
-        connection.execute(
-            "INSERT INTO meta (key, value) VALUES ('last_run', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (when,),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+def worst_severity(severities: Iterable[str]) -> str | None:
+    """Return the worst severity present, or None when there is nothing to rank."""
+    worst: str | None = None
+    for severity in severities:
+        if worst is None or SEVERITY_RANK.get(severity, 0) > SEVERITY_RANK.get(worst, 0):
+            worst = severity
+    return worst
 
 
-Item = TypeVar("Item")
+def breaches(severities: Iterable[str], fail_on: str) -> bool:
+    """True when any row sits at the ``--fail-on`` severity or worse."""
+    if fail_on == "NONE":
+        return False
+    threshold = SEVERITY_RANK.get(fail_on, 0)
+    return any(SEVERITY_RANK.get(severity, 0) >= threshold for severity in severities)
 
 
-def _only_new(
-    items: Sequence[Item], to_record: Callable[[Item], Record], fingerprints: set[str]
-) -> list[Item]:
-    """Keep the items whose snapshot fingerprint was not already stored."""
-    return [item for item in items if to_record(item).fingerprint in fingerprints]
+def _only_new(rows: Iterable[Any], record_of: Any, fresh: set[str]) -> list[Any]:
+    """Keep the rows whose fingerprint this run recorded as new."""
+    return [row for row in rows if record_of(row).fingerprint in fresh]
 
 
-def _tally(severities: Iterable[str]) -> str:
-    """Render ``3 CRITICAL, 8 HIGH`` for the severities present, worst first."""
+# --- phase 5: the output formats -------------------------------------------
+
+
+def _finding_row(finding: Finding) -> dict[str, Any]:
+    """Reduce an over-broad Allow statement to the fields the JSON output carries."""
+    return {
+        "severity": finding.severity,
+        "role": finding.role,
+        "policy": finding.policy,
+        "index": finding.index,
+        "file": finding.source_file,
+        "reason": finding.reason,
+        "statement": finding.statement,
+    }
+
+
+def _escalation_row(escalation: Escalation) -> dict[str, Any]:
+    """Reduce an escalation path to the fields the JSON output carries."""
+    return {
+        "severity": escalation.severity,
+        "role": escalation.role,
+        "actions": list(escalation.actions),
+        "file": escalation.source_file,
+        "reason": escalation.reason,
+    }
+
+
+def _route_row(route: Route) -> dict[str, Any]:
+    """Reduce an assume route to the fields the JSON output carries."""
+    return {
+        "severity": route.severity,
+        "source": route.source,
+        "target": route.target,
+        "hops": len(route.hops) - 1,
+        "path": list(route.hops),
+        "file": route.source_file,
+        "reason": route.reason,
+    }
+
+
+def _counts(severities: Iterable[str]) -> dict[str, int]:
+    """Count rows per severity, worst first."""
     counts: dict[str, int] = {}
     for severity in severities:
         counts[severity] = counts.get(severity, 0) + 1
-    return ", ".join(f"{counts[sev]} {sev}" for sev in SEVERITY_ORDER if sev in counts)
+    return {severity: counts[severity] for severity in sorted(counts, key=lambda s: -SEVERITY_RANK.get(s, 0))}
 
 
-def _suffix(severities: Sequence[str]) -> str:
-    """A `` - 3 CRITICAL, 8 HIGH`` tail, empty when there is nothing to tally."""
-    tally = _tally(severities)
-    return f" - {tally}" if tally else ""
+def _section(rows: Sequence[Any], total: int) -> dict[str, Any]:
+    """Summarise one table: what is new, what the run holds, and the spread."""
+    return {"new": len(rows), "total": total, "by_severity": _counts(row.severity for row in rows)}
 
 
-def render(
-    findings: Sequence[Finding],
-    escalations: Sequence[Escalation],
-    routes: Sequence[Route],
-    scan: Scan,
-    detail_limit: int,
-    drift: Drift,
-) -> str:
+def _fixed_rows(drift: Drift) -> list[dict[str, str]]:
+    """List the rows that were in the snapshot and are not in this run."""
+    return [{"kind": kind, "severity": severity, "what": ident} for kind, ident, severity in drift.fixed]
+
+
+def _suffix(severities: Iterable[str]) -> str:
+    """Render the per-severity breakdown that trails a count line."""
+    counts = _counts(severities)
+    return " - " + ", ".join(f"{count} {severity}" for severity, count in counts.items()) if counts else ""
+
+
+def render_json(report: Report) -> str:
+    """Format the run as one JSON document: the new rows, the drift and the gate.
+
+    Only the rows the report shows are listed - the new ones, or every row on a
+    first run or after ``--reset``. ``counts`` covers the whole run.
+    """
+    document = {
+        "tool": "iam-escalation-lint",
+        "phase": PHASE,
+        "directory": report.directory,
+        "scan": {
+            "files": report.scan.files,
+            "statements": report.scan.statements,
+            "allows": report.scan.allows,
+        },
+        "baseline": {
+            "file": str(report.drift.baseline),
+            "previous_run": report.drift.previous_run,
+            "fixed": _fixed_rows(report.drift),
+            "unchanged": report.drift.unchanged,
+        },
+        "counts": {
+            "findings": _section(report.findings, report.total[0]),
+            "escalations": _section(report.escalations, report.total[1]),
+            "routes": _section(report.routes, report.total[2]),
+        },
+        "gate": {"fail_on": report.fail_on, "breached": report.breached},
+        "findings": [_finding_row(finding) for finding in report.findings],
+        "escalations": [_escalation_row(escalation) for escalation in report.escalations],
+        "routes": [_route_row(route) for route in report.routes],
+    }
+    return json.dumps(document, indent=2)
+
+
+def _sarif_result(
+    rule_index: int,
+    severity: str,
+    location: str,
+    fingerprint: str,
+    message: str,
+    properties: dict[str, str],
+) -> dict[str, Any]:
+    """Build one SARIF result.
+
+    The baseline fingerprint rides along as the partial fingerprint, which is
+    what lets a code-scanning upload update the alert it already has instead of
+    opening a second one for the same row. A row with no source file gets no
+    location rather than an empty one.
+    """
+    result: dict[str, Any] = {
+        "ruleId": SARIF_RULES[rule_index]["id"],
+        "ruleIndex": rule_index,
+        "level": SARIF_LEVEL.get(severity, "warning"),
+        "message": {"text": message},
+        "partialFingerprints": {"iam-escalation-lint/v1": fingerprint},
+        "properties": {
+            **properties,
+            "severity": severity,
+            "security-severity": SECURITY_SEVERITY.get(severity, "5.0"),
+        },
+    }
+    if location:
+        result["locations"] = [{"physicalLocation": {"artifactLocation": {"uri": location}}}]
+    return result
+
+
+def render_sarif(report: Report) -> str:
+    """Format the run as SARIF 2.1.0 for a code-scanning upload.
+
+    One rule per check family, the severity mapped to a code-scanning level, and
+    the drift in the invocation properties: what this run reported, what went
+    fixed, and whether the threshold was breached.
+    """
+    results = [
+        *(
+            _sarif_result(
+                0,
+                finding.severity,
+                finding.source_file,
+                _finding_record(finding).fingerprint,
+                f"{finding.role}/{finding.policy} [{finding.index}]: {finding.reason}",
+                {"role": finding.role, "policy": finding.policy},
+            )
+            for finding in report.findings
+        ),
+        *(
+            _sarif_result(
+                1,
+                escalation.severity,
+                escalation.source_file,
+                _escalation_record(escalation).fingerprint,
+                f"{escalation.role}: {escalation.reason}",
+                {"role": escalation.role},
+            )
+            for escalation in report.escalations
+        ),
+        *(
+            _sarif_result(
+                2,
+                route.severity,
+                route.source_file,
+                _route_record(route).fingerprint,
+                f"{route.source} -> {route.target} in {len(route.hops) - 1} hop(s): {route.reason}",
+                {"role": route.source, "target": route.target},
+            )
+            for route in report.routes
+        ),
+    ]
+    run = {
+        "tool": {
+            "driver": {
+                "name": "iam-escalation-lint",
+                "version": f"phase-{PHASE}",
+                "rules": list(SARIF_RULES),
+            }
+        },
+        "invocations": [
+            {
+                "executionSuccessful": True,
+                "properties": {
+                    "baseline_file": str(report.drift.baseline),
+                    "previous_run": report.drift.previous_run,
+                    "fixed": _fixed_rows(report.drift),
+                    "unchanged": report.drift.unchanged,
+                    "fail_on": report.fail_on,
+                    "breached": report.breached,
+                },
+            }
+        ],
+        "results": results,
+    }
+    return json.dumps({"$schema": SARIF_SCHEMA, "version": "2.1.0", "runs": [run]}, indent=2)
+
+
+def render(report: Report, detail_limit: int) -> str:
     """Format the terminal report: what is new, what was fixed, what stands.
 
     The three tables are already filtered to this run's new rows; on a first
     run that is every row, and the report reads exactly as it did before the
-    baseline existed.
+    baseline existed. A ``--fail-on`` other than NONE appends the gate verdict.
     """
+    findings = report.findings
+    escalations = report.escalations
+    routes = report.routes
+    scan = report.scan
+    drift = report.drift
     fresh = drift.previous_run is not None
     recorded = len(findings) + len(escalations) + len(routes)
 
     lines = [
-        "IAM PRIVILEGE ESCALATION LINT - phase 4 "
-        "(wildcard audit + escalation primitives + reachability + baseline drift)",
+        BANNER,
         f"scanned {scan.files} policy files | {scan.statements} statements | {scan.allows} Allow",
     ]
     if fresh:
@@ -846,9 +1018,7 @@ def render(
     lines.append("")
 
     if findings:
-        rows = [
-            (f.severity, f.role, f.policy, str(f.index), f.reason) for f in findings
-        ]
+        rows = [(f.severity, f.role, f.policy, str(f.index), f.reason) for f in findings]
         widths = [
             max(len("SEV"), max(len(row[0]) for row in rows)),
             max(len("ROLE"), max(len(row[1]) for row in rows)),
@@ -870,9 +1040,7 @@ def render(
             lines.append("")
             lines.append(f"--- statement detail (top {len(detail)}) ---")
             for finding in detail:
-                lines.append(
-                    f"{finding.severity} {finding.role}/{finding.policy} [{finding.index}]"
-                )
+                lines.append(f"{finding.severity} {finding.role}/{finding.policy} [{finding.index}]")
                 lines.append("  " + json.dumps(finding.statement))
     else:
         lines.append(
@@ -886,10 +1054,7 @@ def render(
         role_w = max(len("ROLE"), max(len(e.role) for e in escalations))
         lines.append(f"{'SEV':<{sev_w}}  {'ROLE':<{role_w}}  PATH")
         for escalation in escalations:
-            lines.append(
-                f"{escalation.severity:<{sev_w}}  {escalation.role:<{role_w}}  "
-                f"{escalation.reason}"
-            )
+            lines.append(f"{escalation.severity:<{sev_w}}  {escalation.role:<{role_w}}  {escalation.reason}")
     else:
         lines.append(
             "no new escalation paths" if fresh else "no role holds a known escalation primitive"
@@ -902,10 +1067,9 @@ def render(
         src_w = max(len("FROM"), max(len(r.source) for r in routes))
         lines.append(f"{'SEV':<{sev_w}}  {'FROM':<{src_w}}  HOPS  PATH")
         for route in routes:
-            chain = " -> ".join(route.hops)
             lines.append(
                 f"{route.severity:<{sev_w}}  {route.source:<{src_w}}  "
-                f"{len(route.hops) - 1:>4}  {chain} ({route.reason})"
+                f"{len(route.hops) - 1:>4}  {' -> '.join(route.hops)} ({route.reason})"
             )
     else:
         lines.append(
@@ -926,27 +1090,35 @@ def render(
     lines.append("")
     if fresh and not recorded:
         lines.append(
-            f"nothing new since {drift.previous_run} - "
-            f"{len(drift.fixed)} fixed, {drift.unchanged} unchanged"
+            f"nothing new since {drift.previous_run} - {len(drift.fixed)} fixed, {drift.unchanged} unchanged"
         )
     else:
         mark = " new" if fresh else ""
-        lines.append(f"{len(findings)}{mark} findings" + _suffix([f.severity for f in findings]))
+        lines.append(f"{len(findings)}{mark} findings" + _suffix(f.severity for f in findings))
         lines.append(
-            f"{len(escalations)}{mark} escalation paths"
-            + _suffix([e.severity for e in escalations])
+            f"{len(escalations)}{mark} escalation paths" + _suffix(e.severity for e in escalations)
         )
         lines.append(
-            f"{len(routes)}{mark} assume routes to administrator"
-            + _suffix([r.severity for r in routes])
+            f"{len(routes)}{mark} assume routes to administrator" + _suffix(r.severity for r in routes)
         )
         if fresh:
             lines.append(f"{len(drift.fixed)} fixed, {drift.unchanged} unchanged")
+    if report.fail_on != "NONE":
+        lines.append(
+            f"gate: fail-on {report.fail_on} - "
+            + ("breached, exiting 1" if report.breached else "no new row at or above it")
+        )
     return "\n".join(lines)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Parse arguments, scan the policy directory, print the drift and re-record it."""
+    """Parse arguments, scan the policy directory, report and re-record the drift.
+
+    Returns 1 when a row new to this run is at the ``--fail-on`` severity or
+    worse, 2 when the policy directory is not a directory, and 0 otherwise. The
+    json and sarif formats print their document on stdout and their one-line
+    summary on stderr, so a redirect keeps the document clean.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Report over-broad Allow statements, role-level privilege escalation "
@@ -976,6 +1148,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="ignore the stored baseline and report every finding as new again",
     )
+    parser.add_argument(
+        "--format",
+        choices=("text", "json", "sarif"),
+        default="text",
+        help="output format (default: text)",
+    )
+    parser.add_argument(
+        "--fail-on",
+        type=str.upper,
+        choices=FAIL_LEVELS,
+        default="NONE",
+        help=(
+            "exit 1 when a row new to this run is at this severity or worse "
+            "(default: NONE, never fail)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     directory = Path(args.directory)
@@ -994,24 +1182,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     new_records, fixed, unchanged = compare(previous, records)
     fresh = {record.fingerprint for record in new_records}
 
-    print(
-        render(
-            _only_new(findings, _finding_record, fresh),
-            _only_new(escalations, _escalation_record, fresh),
-            _only_new(routes, _route_record, fresh),
-            scan,
-            args.top,
-            Drift(
-                baseline=baseline,
-                previous_run=last_run,
-                fixed=tuple(fixed),
-                unchanged=unchanged,
-            ),
-        )
+    report = Report(
+        directory=str(directory),
+        scan=scan,
+        findings=tuple(_only_new(findings, _finding_record, fresh)),
+        escalations=tuple(_only_new(escalations, _escalation_record, fresh)),
+        routes=tuple(_only_new(routes, _route_record, fresh)),
+        total=(len(findings), len(escalations), len(routes)),
+        drift=Drift(
+            baseline=baseline,
+            previous_run=last_run,
+            fixed=tuple(fixed),
+            unchanged=unchanged,
+        ),
+        fail_on=args.fail_on,
+        breached=breaches((record.severity for record in new_records), args.fail_on),
     )
+
+    if args.format == "text":
+        print(render(report, args.top))
+    else:
+        print(render_json(report) if args.format == "json" else render_sarif(report))
+        print(
+            f"iamlint {args.format}: {len(new_records)} new rows, "
+            f"worst {worst_severity(r.severity for r in new_records) or 'none'}, "
+            f"fail-on {args.fail_on}",
+            file=sys.stderr,
+        )
 
     try:
         save_baseline(baseline, records, datetime.now().isoformat(timespec="seconds"))
     except sqlite3.Error as exc:
         print(f"warning: baseline not written: {exc}", file=sys.stderr)
-    return 0
+    return 1 if report.breached else 0
