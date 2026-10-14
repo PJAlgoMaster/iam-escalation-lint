@@ -1,22 +1,30 @@
 # iam-escalation-lint
 
-Reads a directory of exported AWS IAM policies and tells you which statements are too broad, and which roles can climb to admin from where they sit.
+I wrote this to read a directory of exported AWS IAM policies and tell me which statements are over-broad and which roles can actually reach administrator.
+It runs offline, on the standard library, on Python 3.
+No API keys, no network, no install step.
 
-I built it because a weekly export of 12 policy files is more than one person can re-read. The linter reads them all in a second and only shows me what changed since last week.
-
-## How to run it
+## Run it
 
 ```
 python main.py
 ```
 
-Python 3, standard library only, no network, no credentials. The sample policies are in the repo, so it runs offline out of the box.
+No arguments. It walks the policy directory that ships in the repo - 12 files, 21 statements, 19 Allow in the sample.
+Every run records findings into a sqlite baseline and prints only what changed since the last one.
 
-It writes findings to a sqlite baseline (`.iamlint-baseline.db`) on the first run. Every run after that prints new, fixed and unchanged findings against that snapshot, so a weekly review is a diff instead of a re-read.
+## What it does
 
-Phase 5 adds SARIF and JSON output plus a severity threshold, so the same command can gate a pull request instead of me reading the terminal.
+It resolves `Allow` with `NotAction`, so a statement that permits "everything except `iam:*`" does not get read as narrow.
+It ranks each statement CRITICAL / HIGH / MEDIUM / LOW by how much of the account it actually touches.
+It flags the escalation primitives that matter: `iam:PassRole` into `lambda:CreateFunction`, `iam:CreatePolicyVersion`, `sts:AssumeRole`.
+It builds the role-to-role trust and assume graph and reports the shortest path from a low-privilege role to one holding `Allow "*" on "*"`.
+It stores findings in a sqlite baseline, so a re-run prints new, fixed and unchanged instead of the same wall of text.
+Phase 5 added SARIF and JSON output plus a severity threshold, so the same command can gate a pull request.
 
-## Example run
+## Example
+
+`python main.py` on the sample policy set prints this:
 
 ```
 warning: baseline not written: table meta has 2 columns but 1 values were supplied
@@ -80,16 +88,17 @@ HIGH      dev-readonly       2  dev-readonly -> release-runner -> ops-admin (ops
 2 assume routes to administrator - 1 CRITICAL, 1 HIGH
 ```
 
-The finding I would have missed by eye is the last one. `dev-readonly` looks harmless, but it can assume `release-runner`, and `release-runner` can assume `ops-admin`, which holds `Allow "*"` on `"*"`. Two hops from a read-only role to the account administrator.
+The first line is real too: the meta row does not insert when the baseline is created. Findings and drift still record, so it is cosmetic, and it is the next thing I fix.
 
-## How it was built
+## Phases
 
-1. **Parse and wildcard report** — walk a policy directory, resolve `Allow` with `NotAction`, print ranked findings (severity, role, statement) end to end.
-2. **Escalation rule engine** — the known escalation primitives (`iam:PassRole` into `lambda:CreateFunction`, `iam:CreatePolicyVersion`, `sts:AssumeRole`) and the role-level combinations that matter.
-3. **Reachability graph** — build the role-to-role trust and assume graph, find shortest paths from a low-privilege role to an admin-equivalent one.
-4. **Baseline and drift** — hold findings in sqlite, so a re-run prints only new, fixed and unchanged findings since the last snapshot.
-5. **CI output and exit codes** — SARIF and JSON plus severity thresholds, so the same command can gate a pull request.
+1. Parse and wildcard report - walks the directory, resolves `Allow` with `NotAction`, prints ranked findings.
+2. Escalation rule engine - the known escalation primitives and the role-level combinations that reach admin.
+3. Reachability graph - role-to-role trust and assume edges, shortest path to an admin-equivalent role.
+4. Baseline and drift - sqlite baseline, prints new, fixed and unchanged since the last snapshot.
+5. CI output and exit codes - SARIF and JSON plus a severity threshold, so one command gates a pull request.
 
-## Where this runs for real
+## In a real environment
 
-In CI, against the IAM Terraform repo on every pull request, failing the build above the chosen threshold. And weekly, against an AWS IAM export dropped in a directory, where the sqlite baseline turns 21 findings into the two or three that changed since last Monday.
+I would run it in CI on every change to the IAM templates, with the severity threshold set so a CRITICAL finding fails the build, and the sqlite baseline committed so the pull request shows only what that change added.
+The 2-hop path above is the kind of thing a weekly manual review misses: nothing in `dev-readonly` looks wrong by itself, it is the route through `release-runner` that matters.
