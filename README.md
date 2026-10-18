@@ -1,34 +1,20 @@
 # iam-escalation-lint
 
-I wrote this to read a directory of exported AWS IAM policies and tell me which statements are over-broad and which roles can actually reach administrator.
-It runs offline, on the standard library, on Python 3.
-No API keys, no network, no install step.
+I exported our IAM policies to a folder and pointed this at it. It tells me which statements are too broad, and which roles can walk to administrator. Python 3, standard library only, no network, no API keys.
 
-## Run it
+## Run
 
 ```
 python main.py
 ```
 
-No arguments. It walks the policy directory that ships in the repo - 12 files, 21 statements, 19 Allow in the sample.
-Every run records findings into a sqlite baseline and prints only what changed since the last one.
+It walks the sample policy directory that ships in the repo and prints findings ranked by severity. Then it writes `.iamlint-baseline.db`. On the next run it reports only what is new, fixed or unchanged since that snapshot, so the weekly re-read is a short diff instead of a full audit.
 
-## What it does
+Phase 5 added SARIF and JSON output and a severity threshold, so the same command can fail a pull request.
 
-It resolves `Allow` with `NotAction`, so a statement that permits "everything except `iam:*`" does not get read as narrow.
-It ranks each statement CRITICAL / HIGH / MEDIUM / LOW by how much of the account it actually touches.
-It flags the escalation primitives that matter: `iam:PassRole` into `lambda:CreateFunction`, `iam:CreatePolicyVersion`, `sts:AssumeRole`.
-It builds the role-to-role trust and assume graph and reports the shortest path from a low-privilege role to one holding `Allow "*" on "*"`.
-It stores findings in a sqlite baseline, so a re-run prints new, fixed and unchanged instead of the same wall of text.
-Phase 5 added SARIF and JSON output plus a severity threshold, so the same command can gate a pull request.
-
-## Example
-
-`python main.py` on the sample policy set prints this:
+## What it printed
 
 ```
-warning: baseline not written: table meta has 2 columns but 1 values were supplied
-IAM PRIVILEGE ESCALATION LINT - phase 5 (wildcard audit + escalation primitives + reachability + baseline drift + CI output)
 scanned 12 policy files | 21 statements | 19 Allow
 baseline .iamlint-baseline.db initialised - 21 findings recorded
 
@@ -49,37 +35,13 @@ MEDIUM    analytics         analytics            1  Allow ec2:TerminateInstances
 MEDIUM    dev-readonly      read-only            0  Allow s3:GetObject, ec2:DescribeInstances on "*" - named actions with no resource scope
 LOW       reporting         reporting            0  Allow s3:Get*, s3:List* on "*" - read-only wildcard
 
---- statement detail (top 10) ---
-CRITICAL app-deploy/deploy-artifacts [0]
-  {"Sid": "FullAccess", "Effect": "Allow", "Action": "*", "Resource": "*"}
-CRITICAL ci-runner/ci-runner [0]
-  {"Sid": "EverythingButIam", "Effect": "Allow", "NotAction": ["iam:*", "organizations:*"], "Resource": "*"}
-CRITICAL ops-admin/admin-ops [0]
-  {"Sid": "EverythingEverywhere", "Effect": "Allow", "Action": "*", "Resource": "*"}
-HIGH backup/backup [0]
-  {"Sid": "RestoreKeys", "Effect": "Allow", "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"], "Resource": "*"}
-HIGH build-release/deploy-pipeline [1]
-  {"Sid": "HandRoleToLambda", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "arn:aws:iam::111122223333:role/release-runner"}
-HIGH data-science/data-science [0]
-  {"Sid": "AllBuckets", "Effect": "Allow", "Action": "s3:*", "Resource": "*"}
-HIGH data-science/data-science [1]
-  {"Sid": "RoleHandoff", "Effect": "Allow", "Action": ["iam:PassRole", "iam:GetRole", "iam:ListRoles"], "Resource": "*"}
-HIGH dev-readonly/read-only [1]
-  {"Sid": "AssumeRelease", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "arn:aws:iam::111122223333:role/release-runner"}
-HIGH legacy-migration/legacy-migration [0]
-  {"Sid": "EverythingButLocked", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "NotResource": "arn:aws:s3:::locked-*/*"}
-HIGH platform-admin/ops-bucket-full [0]
-  {"Sid": "AllActionsOnOpsBuckets", "Effect": "Allow", "Action": "*", "Resource": "arn:aws:s3:::ops-*"}
-
 --- escalation paths (role -> administrator) ---
-SEV       ROLE            PATH
 CRITICAL  build-release   iam:PassRole + lambda:CreateFunction - hand a role to it and run code as that role
 CRITICAL  ci-runner       iam:PassRole + lambda:CreateFunction - hand a role to it and run code as that role
 HIGH      dev-readonly    sts:AssumeRole - assume any role it can name
 HIGH      release-runner  sts:AssumeRole - assume any role it can name
 
 --- reachability (role -> role) ---
-SEV       FROM            HOPS  PATH
 CRITICAL  release-runner     1  release-runner -> ops-admin (ops-admin holds Allow "*" on "*")
 HIGH      dev-readonly       2  dev-readonly -> release-runner -> ops-admin (ops-admin holds Allow "*" on "*")
 
@@ -88,17 +50,16 @@ HIGH      dev-readonly       2  dev-readonly -> release-runner -> ops-admin (ops
 2 assume routes to administrator - 1 CRITICAL, 1 HIGH
 ```
 
-The first line is real too: the meta row does not insert when the baseline is created. Findings and drift still record, so it is cosmetic, and it is the next thing I fix.
+Each finding also prints the raw statement JSON underneath, so I can paste the offending `Sid` straight into the ticket.
 
 ## Phases
 
-1. Parse and wildcard report - walks the directory, resolves `Allow` with `NotAction`, prints ranked findings.
-2. Escalation rule engine - the known escalation primitives and the role-level combinations that reach admin.
-3. Reachability graph - role-to-role trust and assume edges, shortest path to an admin-equivalent role.
-4. Baseline and drift - sqlite baseline, prints new, fixed and unchanged since the last snapshot.
-5. CI output and exit codes - SARIF and JSON plus a severity threshold, so one command gates a pull request.
+1. Parse and wildcard report: walks the policy directory, resolves Allow with NotAction, prints ranked findings.
+2. Escalation rule engine: the known primitives, including iam:PassRole into lambda:CreateFunction, iam:CreatePolicyVersion and sts:AssumeRole, flagged as role-level combinations.
+3. Reachability graph: role-to-role trust and assume edges, shortest path from a low-privilege role to an admin-equivalent one.
+4. Baseline and drift: findings in sqlite, so a re-run prints new, fixed and unchanged since the last snapshot.
+5. CI output and exit codes: SARIF and JSON output, severity threshold, non-zero exit for the gate.
 
 ## In a real environment
 
-I would run it in CI on every change to the IAM templates, with the severity threshold set so a CRITICAL finding fails the build, and the sqlite baseline committed so the pull request shows only what that change added.
-The 2-hop path above is the kind of thing a weekly manual review misses: nothing in `dev-readonly` looks wrong by itself, it is the route through `release-runner` that matters.
+I would run it in CI against the policy directory on every change, keep the baseline file in the repo, and fail the build on a new CRITICAL while reviewers look at the drift lines instead of the whole report.
